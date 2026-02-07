@@ -211,6 +211,76 @@ And a bag bootstrap URL:
 
 This suggests the lyrics endpoint(s) and likely request path templates are *not* hard-coded, but delivered via the bag configuration and resolved at runtime.
 
+#### 2026-02-07 16:13-16:20
+
+At this point I decided to lean harder into two parallel threads:
+
+1. Framework-driven “hard-coded” endpoints and patterns (via `dyld_info`).
+2. Bag-driven “configuration keys” embedded in the Music binary.
+
+##### More detail on iTunesCloud’s AMP API knowledge
+
+From `dyld_info -section __TEXT __cstring /System/Library/PrivateFrameworks/iTunesCloud.framework/Versions/A/iTunesCloud`:
+
+- Concrete endpoints:
+  - `https://amp-api.music.apple.com/v1/me/account?include=social-profile&with=nonOnboarded`
+  - `https://amp-api.music.apple.com/v1/me/social/profile?include=social-profile&with=nonOnboarded`
+- Hostnames:
+  - `amp-api.music.apple.com`
+  - `amp-api-edge.music.apple.com`
+- URL classification regexes:
+  - `.*/v1/catalog/([A-Za-z]+)/albums.*`
+  - `.*/v1/catalog/([A-Za-z]+)/songs.*`
+  - `.*/v1/catalog/([A-Za-z]+)/artists.*`
+  - `.*/v1/me/library/search.*`
+
+This is useful for two reasons:
+
+- It corroborates that `/v1/catalog/{storefront}/...` is a real on-the-wire path shape.
+- It tells me the app/framework ecosystem treats “catalog”, “social”, and “me/library/search” as first-class endpoint families.
+
+##### Bag keys in the Music binary (beyond lyrics)
+
+I broadened the scan in the main Music binary and found a lot of `bag://...` keys, which look like late-bound configuration for “where to talk to which service”.
+
+A few that immediately look relevant to Apple Music APIs:
+
+- `bag://contentPlay/base-url`
+- `bag://sf-api-token-service-url`
+- `bag://radio/fetchMetadata-url`
+- `bag://storeplatform-lookup-url`
+- `bag://storeplatform-lookup-url-unpersonalized`
+- `bag://musicCommon/userProfile`
+- `bag://musicCommon/reportConcern/url`
+
+I also noticed the binary directly includes `amp-api.videos.apple.com` (suggesting a sibling AMP API host used for video catalog/playback metadata).
+
+##### Lyrics: multiple “tracks” for fetching
+
+For lyrics specifically, the binary contains *both* bag keys and separate “cloud-lyrics” strings:
+
+- Bag keys:
+  - `bag://musicSubscription/ttmlLyrics`
+  - `bag://musicSubscription/lyrics`
+- Other (non-bag) keys/labels:
+  - `cloud-lyrics-info`
+  - `cloud-lyrics-token`
+  - `cloud-lyrics`
+
+Near `cloud-lyrics-info`, I saw a URL format string:
+
+- `%S://%S:%u%S/databases/%u/extra_data/%@`
+
+This *smells like* a DAAP-ish path shape (database/extra_data) where the scheme/host/port are variable. I don’t yet know if this is used for:
+
+- local-network sharing (iTunes-style), or
+- a store/cloud backend that happens to reuse a “database/extra_data” abstraction, or
+- an internal protocol wrapper that still uses HTTP(s) but with this path shape.
+
+Next idea:
+
+- Find where `cloud-lyrics-*` and `musicSubscription/*Lyrics` are referenced in code (selectors, symbol names), to identify the request builder and the “final URL shape” before it’s sent.
+
 ### Next steps (near term)
 
 - Expand static scanning beyond the main `Music` binary into likely "API surface" frameworks (`AppleMediaServices`, `iTunesCloud`, `MusicKitInternal`, `AMPLibrary`) to find:
