@@ -341,3 +341,389 @@ First run against `/System/Applications/Music.app/Contents/MacOS/Music`:
   - request path templates
   - JSON keys and response schemas
 - Use Objective-C / Swift metadata dumps (`otool -ov`, `strings` focused on selectors) to locate request builders and parameter names around lyrics, albums, artists, and catalog lookup.
+
+#### 2026-02-07 17:18-
+
+Picking back up with the explicit goal: **follow the lyrics pipeline far enough to identify the request construction + response parsing path**.
+
+Context recap (from earlier work):
+
+- `Music` contains bag keys:
+  - `bag://musicSubscription/ttmlLyrics`
+  - `bag://musicSubscription/lyrics`
+- There are also non-bag strings:
+  - `cloud-lyrics-info`, `cloud-lyrics-token`, `cloud-lyrics`
+- There is a timed-metadata ingestion path in the player that *looks like* it could drive lyric-related state.
+
+I found that `out/` already contains LLDB disassemblies that were produced earlier:
+
+- `out/unnamed_14523.s` (LLDB: `Music` arm64e, `___lldb_unnamed_symbol14523` at `0x10024C628`)
+- `out/unnamed_32280.s` (LLDB: `Music` arm64e, `___lldb_unnamed_symbol32280` at `0x10057AC9C`)
+
+The next immediate step is to decode a C++ vtable that shows up in `___lldb_unnamed_symbol14523`.
+
+Why this matters:
+
+- In `___lldb_unnamed_symbol14523` the code allocates a 0x68-byte object and manually writes a signed vptr.
+- Later it calls a virtual method via vtable lookup (`blraa`) at an offset like `0x78`.
+- If we can recover the *actual target addresses* of the vtable entries, we can disassemble those functions and look for:
+  - references to `bag://musicSubscription/*Lyrics`
+  - references to `cloud-lyrics-*`
+  - TTML parsing (`CreateFromTTML`-style)
+  - URL/request building logic
+
+Key detail: on arm64e these vtable pointers are not plain pointers on disk (they are dyld chained-fixup encodings), so I need `dyld_info -fixup_chain_details` to read the true rebase targets.
+
+#### 2026-02-07 17:18-17:25
+
+First concrete progress: I generated a full fixup dump for the `Music` arm64e slice:
+
+- `out/dyld_fixup_chain_details_arm64e.txt` (34MB)
+
+Then I searched for the vtable “address point” I saw being constructed in `___lldb_unnamed_symbol14523`.
+
+From `___lldb_unnamed_symbol14523` (see `out/unnamed_14523.s`), the vptr is computed as:
+
+- `adrp x16, 6974; add x16, x16, #0x198; add x16, x16, #0x10`
+- This yields an address point at `0x101D8A1A8` in `Music.__DATA_CONST.__const`.
+- VM offset form: `0x01D8A1A8` (since base `0x100000000`)
+
+Looking at `dyld_info -fixup_chain_details`, the bytes at `0x01D8A1A8` are not a literal pointer; it’s an `auth-rebase` fixup.
+
+The vtable entries at and after `0x01D8A1A8` look like:
+
+- `0x01D8A1A8`: `auth-rebase target 0x00000747B20`  -> function `0x100747B20`
+- `0x01D8A1B0`: `auth-rebase target 0x0000024C85C`  -> function `0x10024C85C`
+- `0x01D8A1B8`: `auth-rebase target 0x0000024C860`  -> function `0x10024C860`
+- `0x01D8A1C0`: `auth-rebase target 0x000004BA544`  -> function `0x1004BA544`
+- ... (more entries)
+- `0x01D8A220`: `auth-rebase target 0x0000024C788`  -> function `0x10024C788`
+
+This is already useful because `0x10024C788` is exactly the start of `___lldb_unnamed_symbol14524` (which LLDB printed immediately after `___lldb_unnamed_symbol14523`).
+
+So now I can map the “virtual call at vtable offset 0x78” from `___lldb_unnamed_symbol14523` to a concrete implementation:
+
+- vtable offset `0x78` -> entry address `0x01D8A220` -> target `0x10024C788` -> `___lldb_unnamed_symbol14524`
+
+Next: correlate this with the timed metadata handler.
+
+I also generated a disassembly for the timed-metadata entrypoint by address:
+
+- `out/itmpavitem_timedmetadata_addr.s` (LLDB disassembly starting at `0x10039F484`)
+
+In that disassembly I can now see the exact vtable slot used when processing parsed timed metadata:
+
+- It calls the parser: `bl 0x10057AC9C` (`___lldb_unnamed_symbol32280`).
+- Then it does vtable dispatch via:
+  - `ldr x8, [x16, #0x18]!` then `blraa x8, x17` with `movk x17, #0x592c, lsl #48`.
+
+That `0x592c` constant matches the `diversity: 0x592C` shown in the fixup-chain detail line for vtable entry `0x01D8A1C0`, which strongly confirms:
+
+- the timed-metadata path is calling the vtable function at offset `0x18`
+- the target implementation for that slot is at `0x1004BA544`
+
+So the next immediate disassembly target is `0x1004BA544`.
+
+#### 2026-02-07 17:25-
+
+User reminder: keep `HISTORY.md` close to “live logging”. I’m going to start pasting the exact commands + the specific snippets they unlocked.
+
+First, I did a broad string scan to see if the binary contains any *named* lyrics classes (instead of only generic bag keys):
+
+```sh
+strings -a /System/Applications/Music.app/Contents/MacOS/Music | rg -i "ttml|lyric" | head -n 80
+```
+
+This immediately surfaced a dedicated lyrics stack inside the `Music` binary:
+
+- `StoreGetLyricsRequest`
+- `LyricsHandler` with method `StartGettingStoreLyrics`
+- `StoreLyrics`
+- `LyricsTagParser`
+- TTML parsing types: `TSLLyricsSongInfo`, `TSLLyricsSection`, `TSLLyricsLine`, etc.
+
+This is the first time I’m seeing a *directly named request type* for lyrics (as opposed to only the bag keys).
+
+Next step: resolve these symbols to concrete addresses (via `nm` / `lldb image lookup`), then disassemble around `StoreGetLyricsRequest` and follow where it resolves `bag://musicSubscription/lyrics` or `bag://musicSubscription/ttmlLyrics`.
+
+#### 2026-02-07 17:27-17:32
+
+More concrete lyric-specific anchors.
+
+I asked dyld_info for the *addresses* of the lyrics bag keys inside `Music`’s `__TEXT,__cstring`:
+
+```sh
+dyld_info -arch arm64e -section __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music \
+  | rg -n "bag://musicSubscription/(ttmlLyrics|lyrics)" | head
+```
+
+Result:
+
+- `0x101A3351F` `"bag://musicSubscription/ttmlLyrics"`
+- `0x101A3353E` `"bag://musicSubscription/lyrics"`
+
+Then I checked for a request/op name string that looks analogous to the timed-metadata fetch path (which uses `"StoreFetchTimedMetadataBlobInfo"`).
+
+```sh
+dyld_info -arch arm64e -section __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music \
+  | rg -n '"StoreGetLyrics"' | head
+```
+
+Result:
+
+- `0x101A3354D` `"StoreGetLyrics"`
+
+So we have a plausible triad:
+
+- `StoreGetLyrics` (operation name)
+- `bag://musicSubscription/lyrics`
+- `bag://musicSubscription/ttmlLyrics`
+
+Also, I checked `__oslogstring` for lyric-specific logging I can use as additional anchors:
+
+```sh
+dyld_info -arch arm64e -section __TEXT __oslogstring /System/Applications/Music.app/Contents/MacOS/Music \
+  | rg -i "lyric" | head -n 20
+```
+
+Interesting log strings include:
+
+- `RemoteAssetDownloadManager::SetDownloadedTrackLyrics: ...`
+- `Retrieved lyrics for %u tracks ...`
+- `TrackProcessor::CopyTrackLyricsData: ...`
+- `timed_lyric_animate`
+
+Next step: find the *code* that references the addresses above.
+
+My current hunch is that `StoreGetLyrics` is implemented via the same StoreRequest/vtable machinery as the timed-metadata code path (`StoreFetchTimedMetadataBlobInfo`). In that path I found tiny helper functions that look like:
+
+- load bag key string -> jump to a generic helper
+- load op name string -> jump to a generic helper
+
+If that pattern repeats, there should be small functions in `__TEXT,__text` that reference:
+
+- `"StoreGetLyrics"` and/or
+- `"bag://musicSubscription/lyrics"`
+
+To locate those without a GUI disassembler, I may need to build a small script that scans arm64e `__TEXT,__text` for `adrp/add` sequences that materialize a given target address.
+
+(Also noted for later tooling:)
+
+```sh
+lipo -detailed_info /System/Applications/Music.app/Contents/MacOS/Music | head -n 40
+```
+
+This confirms the universal binary layout:
+
+- x86_64 slice: offset `16384`, size `34797568`
+- arm64e slice: offset `34816000`, size `34747248`
+
+#### 2026-02-07 17:35-18:15: StoreGetLyrics Plumbing Found (Catch-Up)
+
+I ended the previous section with "I may need to build a script that scans `__TEXT,__text` for `adrp/add` pairs". I did that, and it was the key that unlocked most of the lyrics pipeline.
+
+Repo state snapshot (before continuing):
+
+```sh
+cd /Users/tanmaybakshi/apple-music-reverse-engineering
+git status --porcelain=v1
+git log -n 5 --oneline --decorate
+```
+
+At this point:
+
+- `HISTORY.md` is modified.
+- Two new (untracked) scripts exist:
+  - `scripts/find_arm64_adrp_add_xrefs.py`
+  - `scripts/find_arm64_bl_xrefs.py`
+
+##### Tooling: ADRP+ADD xref finder
+
+I created `scripts/find_arm64_adrp_add_xrefs.py` to scan the arm64/arm64e `__TEXT,__text` section for `adrp`+`add` sequences that materialize a *specific* VM address.
+
+This is useful because, even in stripped code, references to cstrings or oslog strings often look like:
+
+```
+adrp xN, <page>
+add  xN, xN, <page_off>
+```
+
+##### Important gotcha: dyld_info cstring addresses are NOT the string start
+
+This took me a while to realize and is worth writing down clearly:
+
+- `dyld_info -section __TEXT __cstring ...` prints the **address of the NUL terminator**, not the address of the first character.
+- To get the string start: `start_addr = dyld_addr - len(string)`.
+
+I verified this directly by comparing dyld_info vs otool for `StoreGetLyrics`:
+
+```sh
+dyld_info -arch arm64e -section __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music \
+  | rg -n '\"StoreGetLyrics\"' | head -n 1
+```
+
+dyld_info shows:
+
+- `0x101A3354D` `"StoreGetLyrics"`
+
+Then:
+
+```sh
+otool -arch arm64e -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music \
+  | rg -n "StoreGetLyrics" | head -n 1
+```
+
+otool shows:
+
+- `0000000101a3353f  StoreGetLyrics`
+
+Length of `"StoreGetLyrics"` is 14 bytes, and `0x101A3353F + 0xE = 0x101A3354D`. So dyld_info is giving the NUL address.
+
+This also explains why my earliest xref attempts looked "off-by-one-ish" and why xrefs sometimes landed one instruction away from what I expected.
+
+##### StoreGetLyrics: key cstring anchors (VM addrs)
+
+I used dyld_info/otool to locate the major lyric keys:
+
+- Response keys:
+  - `"ttml"` at dyld_info NUL `0x101A334F3`, start `0x101A334EF`
+  - `"lyricsId"` at dyld_info NUL `0x101A334FC`, start `0x101A334F4`
+- Bag keys / op name:
+  - `"bag://musicSubscription/ttmlLyrics"` NUL `0x101A3351F`, start `0x101A334FD`
+  - `"bag://musicSubscription/lyrics"` NUL `0x101A3353E`, start `0x101A33520`
+  - `"StoreGetLyrics"` NUL `0x101A3354D`, start `0x101A3353F`
+
+With the ADRP+ADD scanner, I searched for xrefs to those start addrs and found a tight block of functions in `__TEXT,__text` around `0x100809000` that looked like a StoreRequest subclass.
+
+##### StoreGetLyricsRequest: main functions (arm64e)
+
+I disassembled the discovered functions with LLDB and wrote the results into `out/`:
+
+- `out/dis_100809000.s`: includes request ctor + param builder
+- `out/dis_44397_full.s`: full response parser disassembly
+- `out/dis_lyrics_xrefs_block.s`: helper block around the same region
+
+The key methods (arm64e VM addresses):
+
+- `0x100809000` `___lldb_unnamed_symbol44392`
+  - Looks like a ctor/init: calls base ctor, then writes:
+    - `[this+0x170] = x1` (the ID passed in)
+    - `[this+0x178] = w2` (flags)
+  - Also stores a vptr (signed pointer) at `[this+0x0]`.
+- `0x10080906C` `___lldb_unnamed_symbol44395`
+  - Builds request parameters dictionary/array:
+    - Always sets `"id"` to `[this+0x170]`
+    - Sets `"itre"` to either 0 or 1 depending on bit0 of `[this+0x178]`:
+      - `tbnz w8, #0x0, ...` then stores `1`
+      - else stores `0`
+    - Conditionally adds an additional param keyed by the cstring `"'l'"` if a value exists (cbz check on a pointer loaded from stack).
+  - I have no clue what `"'l'"` means yet. It might actually be a quoted single-letter key used in the server API.
+- `0x100809304` `___lldb_unnamed_symbol44397`
+  - Parses the StoreGetLyrics response dictionary and writes into an out-struct (sret):
+    - Out struct layout:
+      - `out+0x0`: 16-byte refcounted value object (lyrics/ttml payload)
+      - `out+0x10`: 1-byte flag (is_ttml)
+      - `out+0x18`: 16-byte refcounted value object (id)
+    - Semantics (inferred from key lookups + emptiness checks):
+      1) Initialize `out+0x10` to 0.
+      2) Look up `"ttml"`; move into `out+0x0`.
+      3) If `out+0x0` is empty, fall back to `"lyrics"` into `out+0x0`.
+      4) If `"ttml"` was non-empty, set `out+0x10 = 1`.
+      5) Look up `"id"` into `out+0x18`.
+      6) If `out+0x18` is empty, fall back to `"lyricsId"` into `out+0x18`.
+- `0x100809754` `___lldb_unnamed_symbol44399`
+  - Chooses the bag key string to use:
+    - If bit `0x2` in `[this+0x178]` is set: returns `"bag://musicSubscription/ttmlLyrics"`
+    - Else: returns `"bag://musicSubscription/lyrics"`
+- `0x100809778` `___lldb_unnamed_symbol44400`
+  - Returns `"StoreGetLyrics"` (the operation name).
+
+I also reverse-identified two generic helpers used by the response parser:
+
+- `0x1007483b0` `___lldb_unnamed_symbol39796`
+  - Move-assign for the 16-byte refcounted value object: releases old, moves new, zeroes source.
+- `0x1007488e0` `___lldb_unnamed_symbol39808`
+  - Emptiness check for that value object:
+    - Returns `1` if empty/null
+    - Returns `0` if non-empty
+
+##### StoreGetLyricsRequest vtable mapping (dyld fixup chain)
+
+Because the binary is pointer-authenticated and stripped, I needed to prove these functions are actually *the* `StoreGetLyricsRequest` vtable entries (and not random code that happens to reference the same strings).
+
+I used `dyld_info -fixup_chain_details` to locate the vtable addresspoint used in the ctor:
+
+- The ctor at `0x100809000` loads a signed vptr from an `adrp/add` materialization that resolves to vtable addresspoint `0x101DD6CA0`.
+
+Then, by scanning the fixup-chain output (`out/dyld_fixup_chain_details_arm64e.txt`), I found vtable entries pointing exactly at my tiny helpers:
+
+- vtable entry -> `0x00000809754` (bag key selector `44399`)
+- vtable entry -> `0x00000809778` (op name `44400`)
+- vtable entry -> `0x0000080906C` (param builder `44395`)
+- destructor-ish entries:
+  - `0x00000809040` and `0x00000809044`
+
+Finally, I found the RTTI-style name string for the type:
+
+- `"21StoreGetLyricsRequest"` in `__TEXT,__const` at VM `0x1018E4175`
+
+So I'm confident the block above is the real StoreRequest subclass for lyrics.
+
+##### Store request HAR logging preference (static anchor)
+
+While looking for other store-request machinery, I found a preference key:
+
+- `"log-request-to-har-path"`
+
+and a log string:
+
+- `"Pref 'log-request-to-har-path' is not present or empty."`
+
+I disassembled the referencing function at `0x100806D70` into:
+
+- `out/dis_100806D70.s`
+
+This looks like it conditionally writes requests out as HAR, which might be extremely useful later (but I'm staying purely static for now).
+
+##### RemoteAssetDownloadManager: lyrics insertion path (static anchor)
+
+From `__oslogstring` I previously saw:
+
+- `Retrieved lyrics for %u tracks out of %d (and set lyrics for %u of those %u)`
+
+I computed its start VM address (using the dyld_info NUL-terminator rule), then ran the ADRP+ADD xref scanner and found a callsite at:
+
+- `0x10145852C`
+
+Disassembling around that site led me to:
+
+- `0x10145811C` `___lldb_unnamed_symbol97647`
+  - `out/dis_10145811C.s`
+
+This function is heavy, but the early portion strongly suggests it iterates a batch of track results and inserts lyrics, logging errors like:
+
+- `"RemoteAssetDownloadManager::SetDownloadedTrackLyrics: HTTPError: %d"`
+- `"RemoteAssetDownloadManager::SetDownloadedTrackLyrics: track lyrics insertion error: %d"`
+
+So, very roughly:
+
+`StoreGetLyrics` fetch -> some batching layer -> `RemoteAssetDownloadManager` insertion.
+
+The missing link is: where does StoreGetLyricsRequest get created and how does its output get forwarded here?
+
+##### Tooling: BL xref finder (to find callsites)
+
+To answer the "missing link" question above, I added another static helper:
+
+- `scripts/find_arm64_bl_xrefs.py`
+
+It scans `__TEXT,__text` for `bl` instructions that resolve to a specific target VM address, so I can find callsites to:
+
+- `StoreGetLyricsRequest` ctor `0x100809000`
+- param builder `0x10080906C`
+- response parser `0x100809304`
+
+Next step: run the BL scanner against those addresses, then disassemble the surrounding functions to map:
+
+- Who sets `[this+0x178]` flags (bit0 + bit1 meaning).
+- Where responses are parsed and handed off (TTML parse vs plain lyrics).
