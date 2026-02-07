@@ -314,6 +314,26 @@ This tightens the mental model:
 - There is a “developer token” concept (likely the Bearer token) and a separate “music user token”.
 - Requests are storefront-aware (storefront header exists and there is lots of machinery around storefront suffixes/combining).
 
+##### Tooling: deterministic bag key extraction
+
+Because I keep coming back to `bag://...` keys as “what services exist” and “what URLs are late-bound”, I wrote a tiny helper script:
+
+- `scripts/extract_bag_keys.py`
+
+It runs `/usr/bin/strings` and extracts all `bag://...` occurrences, producing a unique sorted list and optional grouping.
+
+First run against `/System/Applications/Music.app/Contents/MacOS/Music`:
+
+- Found 47 unique `bag://...` keys.
+- A few that seem directly relevant to Apple Music API surface area:
+  - `bag://musicSubscription/lyrics`
+  - `bag://musicSubscription/ttmlLyrics`
+  - `bag://sf-api-token-service-url`
+  - `bag://contentPlay/base-url`
+  - `bag://radio/fetchMetadata-url`
+  - `bag://storeplatform-lookup-url`
+  - `bag://musicCommon/userProfile`
+
 ### Next steps (near term)
 
 - Expand static scanning beyond the main `Music` binary into likely "API surface" frameworks (`AppleMediaServices`, `iTunesCloud`, `MusicKitInternal`, `AMPLibrary`) to find:
