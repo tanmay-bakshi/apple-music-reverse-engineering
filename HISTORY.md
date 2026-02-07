@@ -281,6 +281,39 @@ Next idea:
 
 - Find where `cloud-lyrics-*` and `musicSubscription/*Lyrics` are referenced in code (selectors, symbol names), to identify the request builder and the “final URL shape” before it’s sent.
 
+##### Quick dead-end: `com.apple.Music.web.bundle` has no web assets
+
+I initially assumed the “web” plug-in would contain JavaScript/HTML with concrete endpoints. But on disk, this bundle appears to contain only:
+
+- `Contents/Info.plist`
+- `Contents/version.plist`
+- `Contents/MacOS/com.apple.Music.web` (Mach-O bundle)
+
+No `.js`, `.html`, `.json` resources were present under `Contents/` (at least at shallow depth). So if Music is using a web surface, it’s likely loading remote content or using another packaging mechanism.
+
+##### Header + auth scheme evidence (developer token + music user token)
+
+Two frameworks/binaries surfaced very explicit evidence of the “Apple Music API style” auth shape:
+
+- In iTunesCloud:
+  - Header names: `Authorization`, `Music-User-Token`
+  - Header format string: `Bearer %@`
+  - ObjC selector / ivar metadata references to:
+    - `ICDeveloperTokenProvider`
+    - `_developerToken`
+    - `ICMusicUserTokenCache`
+    - `_buildMusicKitURLRequestWithBaseURLRequest:completionHandler:`
+    - `_buildUserTokenBasedMusicKitURLRequestWithBaseURLRequest:developerToken:completionHandler:`
+- In AppleMediaServices:
+  - Many Apple request headers as constants, including:
+    - `X-Apple-Store-Front` / `X-Set-Apple-Store-Front`
+    - `X-Apple-Client-Id`, `X-Apple-Client-Versions`, etc.
+
+This tightens the mental model:
+
+- There is a “developer token” concept (likely the Bearer token) and a separate “music user token”.
+- Requests are storefront-aware (storefront header exists and there is lots of machinery around storefront suffixes/combining).
+
 ### Next steps (near term)
 
 - Expand static scanning beyond the main `Music` binary into likely "API surface" frameworks (`AppleMediaServices`, `iTunesCloud`, `MusicKitInternal`, `AMPLibrary`) to find:
