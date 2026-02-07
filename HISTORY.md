@@ -150,6 +150,67 @@ Next steps:
 - Use `dyld_shared_cache_util` (or similar) to confirm that these images exist in the shared cache and extract *only the relevant images* for analysis (avoid multi-GB full extractions).
 - In parallel, inspect the web bundle resources for hard-coded endpoints and request templates.
 
+#### 2026-02-07 16:10-16:13
+
+I got unstuck on the “framework binaries aren’t on disk” issue by realizing two things:
+
+1. On this OS, dyld shared caches live under the cryptex path, not at `/System/Library/dyld/`.
+2. `/usr/bin/dyld_info` can read images directly out of the dyld shared cache using their install-name path, even when the corresponding file does not exist on disk.
+
+Concrete checks:
+
+- Found caches at:
+  - `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e` (plus `.01` and `.map`/`.atlas`)
+- Verified `dyld_info` can open cache images by install name:
+  - `dyld_info -platform /System/Library/PrivateFrameworks/iTunesCloud.framework/Versions/A/iTunesCloud`
+
+This is a huge unlock because it gives me a way to “strings” scan frameworks without needing external extraction tools.
+
+##### First big endpoint discovery: `amp-api.music.apple.com`
+
+I dumped the `__TEXT,__cstring` section for iTunesCloud and immediately saw a concrete AMP API endpoint:
+
+- `https://amp-api.music.apple.com/v1/me/account?include=social-profile&with=nonOnboarded`
+
+Also saw other related host strings and patterns in iTunesCloud:
+
+- `amp-api.music.apple.com`
+- `amp-api-edge.music.apple.com`
+- `https://init.itunes.apple.com/bag.xml`
+- Regex patterns matching catalog endpoints:
+  - `.*/v1/catalog/([A-Za-z]+)/albums.*`
+  - `.*/v1/catalog/([A-Za-z]+)/songs.*`
+  - `.*/v1/catalog/([A-Za-z]+)/artists.*`
+  - `.*/v1/catalog/([A-Za-z]+)/search/suggestions.*`
+  - `.*/v1/(catalog|social)/([A-Za-z]+)/search.*`
+
+Immediate interpretation:
+
+- iTunesCloud “knows about” `/v1/catalog/{storefront}/...` and can identify those URLs.
+- The main “Apple Music” API host appears to be `amp-api.music.apple.com` (at least for some endpoints).
+
+##### MusicKitInternal likely builds URLs dynamically
+
+MusicKitInternal’s `__TEXT,__cstring` contains the hostnames:
+
+- `amp-api.music.apple.com`
+- `amp-api-carry.music.apple.com`
+
+But I didn’t see obvious `/v1/...` path literals in that same section. However, I did see lots of resource-type strings (`albums`, `artists`, `songs`, `library-*`, etc.) and file-path strings such as `MusicCatalogResourceRequest+Internal.swift`, which strongly suggests URL paths are built from smaller pieces.
+
+##### Bag keys for lyrics in the main Music binary
+
+I re-ran a more aggressive `strings` scan on the main `Music` binary and found two especially important bag keys:
+
+- `bag://musicSubscription/ttmlLyrics`
+- `bag://musicSubscription/lyrics`
+
+And a bag bootstrap URL:
+
+- `https://init.itunes.apple.com/bag.xml?ix=6`
+
+This suggests the lyrics endpoint(s) and likely request path templates are *not* hard-coded, but delivered via the bag configuration and resolved at runtime.
+
 ### Next steps (near term)
 
 - Expand static scanning beyond the main `Music` binary into likely "API surface" frameworks (`AppleMediaServices`, `iTunesCloud`, `MusicKitInternal`, `AMPLibrary`) to find:
