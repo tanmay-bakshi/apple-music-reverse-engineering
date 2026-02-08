@@ -2932,3 +2932,63 @@ Net: I still don’t have the “translation rendering” call chain pinned. Nex
 
 - look for *any* code that touches **both** `line + 0xC0` (line key) and `songInfo + 0x90` (translation map) in the same function, or
 - find a function that enumerates translation languages from `songInfo->mTranslationsMap` and see who calls it.
+
+#### 2026-02-07 23:50-: Date sanity + locate Swift lyrics UI entrypoints
+
+Local time check (reconfirming the repo timeline should still be `2026-02-07` here):
+
+```sh
+date
+# Sat Feb  7 23:50:34 EST 2026
+```
+
+Quick `HISTORY.md` structure sanity (the user flagged that I may have briefly used `2026-02-08` earlier):
+
+```sh
+rg -n "2026-02-0[78]" HISTORY.md | head -n 80
+tail -n 120 HISTORY.md
+```
+
+Result:
+
+- `HISTORY.md` still has a single `## 2026-02-07` day header and all timeline sub-headers are `#### 2026-02-07 ...`.
+- The only remaining `2026-02-08` mentions are inside *logged commands* where I explicitly searched for them earlier (not as actual section headers).
+
+While trying to find where translations might be *rendered*, I did a broader symbol-table scan for "lyrics" (not just `TSLLyrics*`), and immediately got a useful hit:
+
+```sh
+nm -m /System/Applications/Music.app/Contents/MacOS/Music | rg -i "lyrics" | head -n 200
+```
+
+Notable symbols surfaced:
+
+- Swift/ObjC class: `_TtC5Music29ImmersiveLyricsViewController` with methods like:
+  - `-[_TtC5Music29ImmersiveLyricsViewController lyrics]` at `0x10000d0b4`
+  - `-[_TtC5Music29ImmersiveLyricsViewController setLyrics:]` at `0x10000d0f4`
+  - `-[_TtC5Music29ImmersiveLyricsViewController loadView]` at `0x10000d5c4`
+- ObjC class: `MPModelLyricsBuilder` (in the app binary)
+- External MediaPlayer model-property symbols:
+  - `_MPModelPropertyLyricsTTML`
+  - `_MPModelPropertyLyricsText`
+  - `_MPModelPropertyLyricsHasTimeSyncedLyrics`
+  - etc.
+
+This strongly suggests the macOS Music app has a Swift-driven lyrics UI stack (at least for an "immersive" lyrics experience), and it likely consumes `MPModelLyrics` data that includes TTML.
+
+I disassembled those view-controller methods to look for calls into our TTML parser (`TSLLyricsSongInfo::CreateFromTTML` at `0x101729d98`) or other obvious translation hooks:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10000d0b4 -c 500 -b -r" -o "quit" > out/dis_10000d0b4_ImmersiveLyricsViewController_lyrics.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10000d0f4 -c 700 -b -r" -o "quit" > out/dis_10000d0f4_ImmersiveLyricsViewController_setLyrics.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10000d5c4 -c 900 -b -r" -o "quit" > out/dis_10000d5c4_ImmersiveLyricsViewController_loadView.s
+```
+
+Initial conclusion from the `setLyrics:` disassembly:
+
+- The `setLyrics:` entrypoint itself is basically a Swift property setter.
+- The "real work" (if any) is not directly in that setter; it stores the object in an ivar slot and releases the previous value.
+- I did *not* see an obvious direct call into `CreateFromTTML` from these short entrypoints, which means the parsing/rendering is likely happening elsewhere (view model, renderer, or a downstream object invoked later).
+
+Next direction:
+
+- I need a more structural way to find translation *consumption* (not parsing). The best hypothesis is still: find a function that touches both `songInfo + 0x90` (translations map) and `line + 0xC0` (line key), or otherwise enumerates `songInfo->mTranslationsMap` to produce a language list for UI.
