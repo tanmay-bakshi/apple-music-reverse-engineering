@@ -2844,3 +2844,91 @@ Next:
   - `line->mParentSection`
   - `line->mOriginalLineIndex`
   - the section’s “songPart” field and the “section type” meaning beyond `8`.
+
+#### 2026-02-07 23:40-23:47: Trying to find translation *rendering* / UI integration (no solid hit yet)
+
+Local time check:
+
+```sh
+date
+# Sat Feb  7 23:47:26 EST 2026
+```
+
+I took a first swing at “where do translations get applied?” by looking for any UI/controller code that seems lyrics-specific, and by searching for likely class names.
+
+##### Symbol scan: only one `TSLLyrics*` ObjC class is in the symbol table
+
+Command:
+
+```sh
+nm -m /System/Applications/Music.app/Contents/MacOS/Music | rg "TSLLyrics" | head -200
+```
+
+Result:
+
+- The symbol table only surfaces `TSLLyricsControllerWrapper` (ObjC) and its methods like `loadView`, `viewWillAppear`, etc.
+- No obvious “translation” or “transliteration” class names appear in symbols.
+
+##### Static string scan: there *is* a C++ `TSLLyricsViewController` name in the binary
+
+This came from a quick TSLLyrics-focused string sample:
+
+```sh
+/usr/bin/strings -a -n 4 /System/Applications/Music.app/Contents/MacOS/Music | rg "TSLLyrics" | head -500 | sort -u | head -200
+```
+
+Notable lines included:
+
+- `TSLLyricsViewController::ClearHighlight`
+- `TSLLyricsViewController::RollOutDelay`
+
+I tried to use these as “anchors” to find related code.
+
+##### `otool` gives VM addresses for those method-name strings, but xrefs are misleading
+
+Commands:
+
+```sh
+otool -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg "TSLLyricsViewController::(ClearHighlight|RollOutDelay)"
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101aa79d4 --window 12
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101aa781b --window 12
+```
+
+Output:
+
+- `0x101aa781b`: `TSLLyricsViewController::RollOutDelay`
+- `0x101aa79d4`: `TSLLyricsViewController::ClearHighlight`
+
+But the ADRP+ADD xrefs landed at:
+
+- `0x101728AD8` / `0x101728AEC` / `0x101728AF0`
+
+…which is squarely inside the TSLLyrics XML parsing “utility” region (near `108708` attribute lookup etc), not in some UI controller.
+
+Disassembling around there (`out/dis_101728a80_misc.s`) shows those strings are loaded inside `___lldb_unnamed_symbol108706`:
+
+```asm
+0x101728ad8: adrp x0, ... ; "TSLLyricsViewController::RollOutDelay"
+0x101728ae0: bl   0x1006eb398
+...
+0x101728af0: add  x0, x0, #0x9d4  ; "TSLLyricsViewController::ClearHighlight"
+0x101728b08: b    0x1006eb398
+```
+
+So those strings are being used by some helper function (maybe building a couple of static `ITString`s?) and *not* directly as log-context from the view controller’s code. In other words: this didn’t help me find the rendering path.
+
+##### Disassembled `TSLLyricsControllerWrapper` methods anyway (no translation clues)
+
+I dumped a couple of wrapper functions just to see if they touch translation state:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10143d50c -c 600 -b -r" -o "quit" > out/dis_10143d50c_TSLLyricsControllerWrapper_loadView.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10143d84c -c 220 -b -r" -o "quit" > out/dis_10143d84c_TSLLyricsControllerWrapper_lyricsPlusPlusView.s
+```
+
+These are mostly Objective-C message sends and view wiring; nothing obvious about `TSLLyricsSongInfo + 0x90` or `line + 0xC0` (line key) yet.
+
+Net: I still don’t have the “translation rendering” call chain pinned. Next I think I should:
+
+- look for *any* code that touches **both** `line + 0xC0` (line key) and `songInfo + 0x90` (translation map) in the same function, or
+- find a function that enumerates translation languages from `songInfo->mTranslationsMap` and see who calls it.
