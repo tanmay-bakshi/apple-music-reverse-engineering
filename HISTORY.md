@@ -1290,3 +1290,97 @@ It also contains assert strings:
 - `"playActivityFeed != nullptr"`
 
 So `86656` looks like a lyrics-to-play-activity-feed bridge: it’s invoked when lyrics are available, and it kicks off the “consume AssetData -> parse TTML -> build UI model” chain.
+
+#### 2026-02-07 20:00+
+
+Continuing from the `bag://musicSubscription/(lyrics|ttmlLyrics)` discovery.
+
+I wanted to understand what `0x10074AC44` (`___lldb_unnamed_symbol39840`) is doing, since `43920` calls it right after constructing the literal string `"bag://"`.
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10074AC44 -c 260 -b -r" -o quit > out/dis_10074AC44.s
+```
+
+Findings:
+
+- `0x10074AC44` (`39840`) is a *prefix/equality* style compare for the project’s `ITString`-like type.
+- In the `flags == 0` path it explicitly checks `len(haystack) >= len(needle)` before doing a 16-bit character compare loop.
+  - That pattern matches a `HasPrefix`/`StartsWith` primitive.
+- In the `flags != 0` path (used by `43920` because it passes `w2 = 0x1B1`) it forwards into `0x10074AE34` (`39841`) after some optional `os_log_type_enabled` gating.
+
+Key excerpt (supports “prefix” semantics):
+
+```asm
+; out/dis_10074AC44.s
+; ...
+cbz    w21, 0x10074acc4              ; if flags==0, do length/compare locally
+
+; flags==0 path:
+ldr    x8, [x20]
+ldr    x21, [x8]                     ; x21 := len(haystack)
+mov    x0, x19
+bl     0x1007487f8                   ; 39805: len(needle)
+cmp    x21, x0
+b.lo   0x10074ad10                   ; if len(haystack) < len(needle) => false
+
+; then compares UTF-16 chars for (len(needle))
+ldrh   w8, [x10], #0x2
+ldrh   w9, [x20], #0x2
+cmp    w8, w9
+...
+```
+
+So: inside `43920`, the `0x10074AC44(..., "bag://", 0x1B1)` call is very plausibly the guard “URL begins with bag://”.
+
+More details on the `43920` (“request has URL / bag://”) decision:
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1007488E0 -c 120 -b -r" -o quit > out/dis_1007488E0.s
+```
+
+- `0x1007488E0` (`___lldb_unnamed_symbol39808`) returns `w0 = 1` when the `ITString`-like object is empty / null, and `w0 = 0` when it contains a backing buffer.
+- That matches the control flow in `43920`: if empty -> it logs `"Request has no URL."`, else it goes down the `bag://` resolution path.
+
+Key excerpt:
+
+```asm
+; out/dis_1007488E0.s
+; if string has backing storage -> return 0
+ldr    x8, [x0]
+cbz    x8, <check other repr>
+ldr    x8, [x8]
+cbz    x8, <check other repr>
+mov    w0, #0
+ret
+
+; else return 1 when length==0 or repr missing
+...
+```
+
+I also disassembled the `"split by '/'"` helper used by `43920`.
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10074BDC8 -c 240 -b -r" -o quit > out/dis_10074BDC8.s
+```
+
+- `0x10074BDC8` (`___lldb_unnamed_symbol39858`) takes `(ITString haystack, ITString delimiter, outObj in x8)`.
+- It converts `haystack` into a `CFString` via `CFStringCreateWithCharactersNoCopy` and then feeds it into a CF/Foundation-ish splitting routine (`38969`).
+- In `43920`, this is invoked with delimiter `"'/'"`, which fits the pattern of parsing `bag://musicSubscription/lyrics` into path components.
+
+Key excerpt:
+
+```asm
+; out/dis_10074BDC8.s
+bl     0x1017f3654               ; CFStringCreateWithCharactersNoCopy
+...
+bl     0x10072466c               ; 38969: likely split/parse into outObj (x8)
+```
