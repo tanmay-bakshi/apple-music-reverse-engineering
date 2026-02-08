@@ -3052,22 +3052,20 @@ Implications for `TSLLyricsLine` layout (building on earlier findings):
 
 So: scanning for “offset 0x90” is tricky because `0x90` is also used as a weak ctrl pointer offset inside `TSLLyricsLine`, *not only* as `TSLLyricsSongInfo + 0x90` translations-map storage.
 
-#### 2026-02-07 23:59-00:20: Date rollover / timezone note
+## 2026-02-08
 
-The user called out that it’s still Feb 7 for them. My machine is set to `EST`, and local time rolled over while I was working:
+Local time rolled over into a new day while I was working:
 
 ```sh
 date
 # Sun Feb  8 00:17:09 EST 2026
 ```
 
-To avoid confusion in this narrative, I’m keeping this *session* under the `## 2026-02-07` day header and logging `date` outputs when midnight/timezone boundaries matter.
-
-##### (note to self) avoid date rollover mistakes
+#### 2026-02-08 00:05-: (note to self) avoid date rollover mistakes
 
 When I’m near midnight, I need to keep re-checking local time and only start a new `## YYYY-MM-DD` day header *after* the rollover (and include the `date` output as evidence).
 
-##### Found `mLyricsViewController` / `mLyricsView` asserts and a shared_ptr-returning “get view” helper
+#### 2026-02-08 00:20-: Found `mLyricsViewController` / `mLyricsView` asserts and a shared_ptr-returning “get view” helper
 
 I found a few more lyrics-view-controller related *member-name* strings in the binary and used them as anchors.
 
