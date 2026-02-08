@@ -1384,3 +1384,136 @@ bl     0x1017f3654               ; CFStringCreateWithCharactersNoCopy
 ...
 bl     0x10072466c               ; 38969: likely split/parse into outObj (x8)
 ```
+
+More `bag://` resolution details (continuing under the same `2026-02-07` local time section).
+
+I wanted to understand what happens after the bag key has been resolved into a “real” URL string, specifically:
+
+- how `bag://...` becomes a `CFURLRef`
+- what validations are applied before the request proceeds
+
+##### `bag://` string -> CFURL
+
+`43920` calls `0x1003E0E24` (`23735`) with:
+
+- `x0 = sp+0x90` (out param)
+- `x1 = sp+0x68` (resolved URL string; initially came from `bag://...`)
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1003E0E24 -c 260 -b -r" -o quit > out/dis_1003E0E24.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1007242DC -c 220 -b -r" -o quit > out/dis_1007242DC.s
+```
+
+Findings:
+
+- `0x1003E0E24` (`23735`) is basically:
+  1. build a `CFStringRef` from the project’s `ITString`-like object
+  2. build a `CFURLRef` from that CFString via `CFURLCreateWithString`
+
+Key excerpt:
+
+```asm
+; out/dis_1003E0E24.s
+add    x0, sp, #0x8
+bl     0x1007242dc               ; 38954: make CFString from ITString
+add    x1, sp, #0x8
+mov    x0, x19
+bl     0x100724964               ; 38985: CFURLCreateWithString
+```
+
+And `38954` confirms the “ITString -> CFString” conversion:
+
+```asm
+; out/dis_1007242DC.s
+mov    x8, x1
+...
+ldr    x1, [global CFAllocator]
+mov    x0, x8
+bl     0x1007490f4               ; 39811: returns CFStringRef
+str    x0, [x19]                 ; store into wrapper
+```
+
+So the “resolved URL string” is converted into a CFURL at this stage.
+
+##### CFURL validations (host present + https scheme)
+
+In `43920`, immediately after creating the CFURL (`sp+0x90`), there are two checks:
+
+- `0x10072606C` (`39013`)
+- `0x100724CB8` (`38995`)
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10072606C -c 200 -b -r" -o quit > out/dis_10072606C.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x100724CB8 -c 240 -b -r" -o quit > out/dis_100724CB8.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x100725074 -c 220 -b -r" -o quit > out/dis_100725074.s
+```
+
+`39013` checks that the CFURL can be decomposed *and* has a non-empty hostname.
+
+Key excerpt:
+
+```asm
+; out/dis_10072606C.s
+ldr    x0, [x0]
+cbz    x0, <fail>
+bl     CFURLCanBeDecomposed
+cbz    w0, <fail>
+mov    x8, sp
+mov    x0, x19
+bl     0x100725074               ; 39000: extract hostname
+mov    x0, sp
+bl     0x1007488e0               ; 39808: empty?
+eor    w19, w0, #0x1             ; return !empty
+```
+
+And `39000` is literally `CFURLCopyHostName`:
+
+```asm
+; out/dis_100725074.s
+ldr    x0, [x0]
+cbz    x0, <ret>
+bl     CFURLCopyHostName
+...
+```
+
+`38995` verifies that the URL scheme is exactly `"https"`:
+
+```asm
+; out/dis_100724CB8.s
+mov    x8, sp
+bl     0x100724b20               ; 38991: extract scheme into ITString (sp)
+adrp   x1, ... ; "https"
+mov    x0, sp
+bl     0x10074ab2c               ; 39839: compare
+cset   w19, eq                   ; return (compare == 0)
+```
+
+So: the bag lookup must resolve to an HTTPS URL with a hostname, otherwise this request path bails.
+
+#### 2026-02-07 20:26-20:30
+
+Quick sanity check on local time and HISTORY structure (prompted by noticing a mismatch between local time and an earlier header).
+
+Commands:
+
+```sh
+date
+git status --porcelain=v1 -b
+rg -n "^#### 2026-02-" HISTORY.md
+rg -n "^#### 2026-02-08" HISTORY.md
+```
+
+Observed:
+
+- Local machine time is `Sat Feb  7 20:26:46 EST 2026`.
+- No remaining `2026-02-08` headers in `HISTORY.md` (so the timeline is aligned to *local* time again).
+- `HISTORY.md` had uncommitted additions (the CFURL validation notes appended above) and should be committed before continuing.
