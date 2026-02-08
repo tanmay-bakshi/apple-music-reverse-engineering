@@ -3064,3 +3064,55 @@ date
 #### 2026-02-08 00:05-: (note to self) avoid date rollover mistakes
 
 When I’m near midnight, I need to keep re-checking local time and only start a new `## YYYY-MM-DD` day header *after* the rollover (and include the `date` output as evidence).
+
+#### 2026-02-08 00:20-: Found `mLyricsViewController` / `mLyricsView` asserts and a shared_ptr-returning “get view” helper
+
+I found a few more lyrics-view-controller related *member-name* strings in the binary and used them as anchors.
+
+CString scan:
+
+```sh
+otool -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "LyricsView"
+```
+
+Notable cstrings (with VM addresses):
+
+- `0x101a568ee`: `mLyricsViewController != nullptr`
+- `0x101a8d627`: `mLyricsViewController`
+- `0x101a8d6a0`: `mLyricsView`
+
+Xrefs via ADRP+ADD (to find candidate code to disassemble):
+
+```sh
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101a568ee --window 16
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101a8d627 --window 16
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101a8d6a0 --window 16
+```
+
+This led me into a big function region near `0x10144d22c` that logs assertion failures mentioning `containerView`, `mLyricsViewController`, and `mLyricsView` (likely field-name strings used by some internal assert/logging helper).
+
+I don’t yet have the *class name*, but I *do* have a concrete helper function that looks like it returns a `shared_ptr` view from a controller object:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x1010ff054 -c 420 -b -r" -o "quit" > out/dis_1010ff054_83787.s
+```
+
+Key behavior inside `___lldb_unnamed_symbol83787` (`0x1010ff054`):
+
+- Treats `x0` as an object with a `shared_ptr` stored at `+0x58/+0x60`.
+- Writes that `shared_ptr` to the output pointer given in `x8`.
+- If the view pointer is missing, it logs an assertion failure mentioning `mView != nullptr`.
+
+Evidence snippet:
+
+```asm
+0x1010ff084: ldr    x8, [x0, #0x58]
+...
+0x1010ff180: ldr    x8, [x20, #0x58]
+0x1010ff180: ldr    x9, [x20, #0x60]
+0x1010ff184: stp    x8, x9, [x19]          ; store 16B (shared_ptr) to out param
+...
+0x1010ff214: add    x8, x8, #0x718         ; "mView != nullptr"
+```
+
+This is a concrete “lyrics view controller owns a view in a `shared_ptr`” data point, and it gives me a new foothold for chasing *render-time* logic (likely the controller’s other vtable-dispatched methods that run before returning the view).
