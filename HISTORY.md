@@ -2589,3 +2589,258 @@ Immediate implications:
   - base line key: `TSLLyricsLine + 0xC0` (from `itunes:key`)
   - translation ref key: `TSLLyricsTranslationText + 0x70` (from `for=`)
   - translated text content: `TSLLyricsTranslationText + 0x60`
+
+#### 2026-02-07 23:30-: Date sanity + major `CreateFromTTML` structure decode (timing type, sections, instrumental gaps, line linking)
+
+Local time check (reconfirming the project’s timeline should still be under `2026-02-07`):
+
+```sh
+date
+# Sat Feb  7 23:30:25 EST 2026
+```
+
+Quick scan for the “wrong date” issue:
+
+```sh
+rg -n "^(##|###|####) 2026-02-08" HISTORY.md
+# (no matches)
+```
+
+So the only remaining `2026-02-08` mentions are in my own logged commands, not as section headers. This aligns with local time still being Feb 7.
+
+Now back to lyrics.
+
+I focused on `TSLLyricsSongInfo::CreateFromTTML` (`___lldb_unnamed_symbol108718` at `0x101729d98`) and tried to answer the next big structural questions:
+
+- What is `songInfo + 0x18` actually representing?
+- What *exactly* is stored at `songInfo + 0x78` and how does it relate to instrumental gaps?
+- How are sections/lines wired together after parsing?
+
+##### `songInfo + 0x18` is a “timing granularity” enum (likely 1/2/3 = none/line/word)
+
+I already knew `songInfo + 0x18` starts as `1` (constructor behavior), and I’d seen a consumer (`108914`) storing it into some upstream object. I wanted a firm meaning.
+
+In `CreateFromTTML`, there’s a loop that walks the parsed line list and inspects timings on:
+
+1) the line itself (start/end), and
+2) the line’s word list (each word start/end).
+
+If it sees any word timings, it forces `songInfo + 0x18 = 3`. Otherwise, if it sees any line timings, it forces `songInfo + 0x18 = 2`. If neither exists, it remains `1`.
+
+Evidence (from `out/dis_101729d98.s`):
+
+```asm
+; constants:
+0x101729e8c: mov w23, #0x2          ; candidate: line-timed
+0x101729e90: mov w24, #0x3          ; candidate: word-timed
+0x101729e94: mov w25, #0x1          ; default/none
+
+; per-line: x26 = TSLLyricsLine*
+0x101729ea8: ldp x27, x28, [x26, #0xa8]    ; line->mWords vector (begin/end) @ +0xA8
+
+; per-word: x8 = TSLLyricsWord*
+0x101729ec4: ldr d0, [x8, #0x40]            ; word start?
+0x101729ed0: ldr d0, [x8, #0x48]            ; word end?
+0x101729eec: ldr x8, [sp, #0x40]            ; songInfo ptr
+0x101729ef0: str w24, [x8, #0x18]           ; songInfo->timingType = 3 (word timed)
+
+; line-level timings:
+0x101729f0c: ldr d0, [x26, #0x40]            ; line start?
+0x101729f18: ldr d0, [x26, #0x48]            ; line end?
+0x101729f24: str w23, [x8, #0x18]            ; songInfo->timingType = 2 (line timed)
+```
+
+This is a nice clean story:
+
+- `timingType == 1`: no start/end times anywhere (static/plain lyrics)
+- `timingType == 2`: lines have start/end but words do not (line-synced)
+- `timingType == 3`: words have start/end (word-synced)
+
+I’m still calling it an “inferred enum” until I see a log string or a switch table on the values, but the evidence is strong.
+
+##### `songInfo + 0x78` is a `vector<shared_ptr<TSLLyricsSection>>` and `TSLLyricsSection + 0x60` is a “section type”
+
+I already suspected `songInfo + 0x78` was “sections” because the plain-text flattener iterates it. `CreateFromTTML` makes this *very* concrete.
+
+If `songInfo->timingType != 1`, `CreateFromTTML` iterates the sections vector and looks for gaps between adjacent sections. If it finds a large gap, it inserts a new “instrumental” section in-between.
+
+Evidence (from `out/dis_101729d98.s`):
+
+```asm
+0x101729fa0: ldr w8, [x20, #0x18]    ; songInfo->timingType
+0x101729fa4: cmp w8, #0x1
+0x101729fa8: b.eq ...                ; no timed lyrics => skip instrumental-section insertion
+
+0x101729fb0: ldp x8, x9, [x22, #0x78]!  ; section vector begin/end (shared_ptr pairs, 16B each)
+
+; section loop: x28 = section*, x21 = control block
+0x101729ff0: ldr w8, [x28, #0x60]    ; section->type
+0x101729ff4: cmp w8, #0x8
+0x101729ff8: b.eq ...                ; already instrumental => skip gap logic
+
+; gap = section->start - prevEnd
+0x101729ffc: ldr d0, [x28, #0x40]    ; section start time
+0x10172a000: fsub d0, d0, d9         ; d9 tracks prevEnd
+0x10172a004: fcmp d0, d8             ; d8 = 7.0
+0x10172a008: b.le ...                ; small gap => no insertion
+
+; allocate TSLLyricsSection (size 0x98) and mark it as instrumental (type=8)
+0x10172a00c: mov w0, #0x98
+0x10172a024: bl  0x10171b690         ; 108457: TSLLyricsSection ctor
+0x10172a038: str d9, [x10, #0x40]    ; new->start = prevEnd
+0x10172a040: str d0, [x10, #0x48]    ; new->end   = section->start
+0x10172a044: str w26, [x10, #0x60]   ; new->type  = 8
+```
+
+Also interesting: the “end-of-song” missing instrumental gap threshold is *much* larger than 7 seconds:
+
+```asm
+0x10172a360: ldr d0, [songInfo, #0x20]   ; looks like song duration
+0x10172a364: fsub d0, d0, d9             ; trailingGap = duration - lastSectionEnd
+0x10172a368: fmov d1, #120.0
+0x10172a370: fcmp d0, d1
+0x10172a374: b.le ...                    ; <= 120s => don’t insert end instrumental section
+```
+
+So:
+
+- in-between gaps: insert if gap > 7 seconds
+- trailing gap: insert if gap > 120 seconds
+
+I’m guessing this is to avoid painting common “tail silence” as instrumental unless it’s extreme.
+
+##### `TSLLyricsSection::ParseXML` behavior: section has `itunes:songPart`, contains `<p>` lines, and forces empty sections to type=8
+
+While chasing section semantics, I noticed that my earlier `out/dis_1017294a4.s` dump (which started at `TSLLyricsLine::ParseXML`) contains additional adjacent functions. One of them (`___lldb_unnamed_symbol108716` at `0x101729a0c`) is clearly section parsing.
+
+It reads `itunes:songPart` into a member at `this + 0x8` via `108440`, then enumerates its children and parses lines. It also has a strong policy:
+
+- If a section has **no lines** and its type is not already `8`, it logs a warning and forces `type = 8` (instrumental).
+
+Evidence (from `out/dis_1017294a4.s`):
+
+```asm
+; read itunes:songPart into section + 0x8
+0x101729a48: adrp x1, ... ; "itunes:songPart"
+0x101729a70: bl   0x101719d28       ; 108440: store/copy attribute into section member
+0x101729a88: add  x1, x19, #0x8
+0x101729a8c: bl   0x10092d920       ; 49895 (looks like timing parse helper used elsewhere too)
+
+; after enumerating child lines:
+0x101729ae8: ldp  x9, x8, [x19, #0x80]  ; section->mLines vector begin/end @ +0x80
+0x101729aec: cmp  x8, x9               ; empty?
+0x101729af4: ldr  w8, [x19, #0x60]     ; section->type
+0x101729af8: cmp  w8, #0x8
+...
+0x101729b38: ... "WARNING: Detected lyrics section with no lines; forcing to instrumental"
+0x101729b50: mov  w8, #0x8
+0x101729b54: str  w8, [x19, #0x60]     ; section->type = 8
+```
+
+The *really* juicy part is the huge assert string inside this function (not included verbatim here), which explicitly describes the child enumeration:
+
+- If child is `kXMLElementLine`:
+  - allocate `TSLLyricsLine`
+  - `line->ParseXML(...)`
+  - drop empty `line->mLyricsText.Trim().IsEmpty()` (logs “Dropping empty line, time span %g - %g”)
+  - else:
+    - `line->mParentSection = thisRef`
+    - `line->mLineIndex = line->mOriginalLineIndex = lyricsLineList.size()`
+    - `mLines.push_back(line)`
+    - `lyricsLineList.push_back(line)`
+
+So at a data-model level, the “section vs songInfo lines vector” split is:
+
+- `TSLLyricsSection::mLines`: per-section list of lines
+- `TSLLyricsSongInfo::mLines`: global flattened list across all sections
+
+##### `TSLLyricsSongInfo::SetLines`-like function (`108429`) sets `line + 0x78` index and stores a weak “next line” link at `line + 0x98`
+
+I disassembled `___lldb_unnamed_symbol108429` at `0x101718e98` into `out/dis_101718e98.s` to see what it does when `CreateFromTTML` calls it with the stack `lyricsLineList` vector.
+
+The very first thing it does is compare `x1` with `this + 0x60`, which makes it almost certainly “assign/move lines vector into songInfo”:
+
+```asm
+0x101718eb4: add x0, x0, #0x60
+0x101718eb8: cmp x0, x1
+```
+
+Then it walks `songInfo + 0x60` and for each `TSLLyricsLine`:
+
+1) stores a monotonically increasing index into `line + 0x78`,
+2) stores a *weak* reference to the “next” line into `line + 0x98` (object+control) and releases the prior weak control at `line + 0xA0`.
+
+Evidence (from `out/dis_101718e98.s`):
+
+```asm
+; i -> line->mLineIndex?
+0x101718f2c: str x22, [x10, #0x78]
+
+; line->mNextLine (weak) = next line shared_ptr
+0x101718f48: ldp x9, x8, [x8, #0x10]   ; load next line shared_ptr (obj, ctrl)
+0x101718f50: add x11, x8, #0x10
+0x101718f54: ldadd x23, x11, [x11]     ; inc weak count (ctrl + 0x10)
+0x101718f5c: stp x9, x8, [x10, #0x98]  ; store into line + 0x98
+0x101718f64: bl  __release_weak        ; release old weak ctrl at line + 0xA0
+
+; last line => nextLine weak ptr cleared
+0x101718f94: stp xzr, xzr, [x10, #0x98]
+```
+
+This is awesome because it gives me two new stable offsets for `TSLLyricsLine`:
+
+- `TSLLyricsLine + 0x78`: line index (size_t)
+- `TSLLyricsLine + 0x98`: weak next-line storage (two pointers), with the old ctrl pointer at `+0xA0`
+
+##### Per-section post-processing (`108441`) computes average line duration into `section + 0x78`
+
+In `CreateFromTTML`, after calling `108429`, it iterates sections and calls `___lldb_unnamed_symbol108441` at `0x101719f5c`.
+
+Disassembling that into `out/dis_101719f5c.s` shows it computes an average line duration:
+
+- It only runs if `section + 0x78` is currently 0.
+- It iterates `section->mLines` vector at `section + 0x80` and for each line, adds `(line->end - line->start)`.
+- It divides by line count and stores back to `section + 0x78`.
+
+Evidence (from `out/dis_101719f5c.s`):
+
+```asm
+0x101719f5c: ldr d0, [x0, #0x78]
+0x101719f60: fcmp d0, #0.0
+0x101719f64: b.ne ... ; already computed
+
+; iterate section + 0x80 vector of lines
+0x101719fb0: ldp d1, d0, [x8, #0x40]   ; line start/end
+0x101719fb4: fsub d9, d0, d1           ; duration
+0x101719fc8: fadd d8, d8, d9           ; accumulate
+
+; avg = total / count
+0x101719fe8: fdiv d0, d8, d0
+0x101719fec: str  d0, [x19, #0x78]     ; store avg
+```
+
+So `TSLLyricsSection + 0x78` is (very likely) `averageLineDuration` (double).
+
+##### New artifacts created under `out/` (gitignored)
+
+Commands I ran:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x101718e98 -c 650 -b -r" -o "quit" > out/dis_101718e98.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x101719f5c -c 650 -b -r" -o "quit" > out/dis_101719f5c.s
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10171b690 -c 450 -b -r" -o "quit" > out/dis_10171b690.s
+```
+
+Files:
+
+- `out/dis_101718e98.s` (`108429`): line vector assignment + line linking
+- `out/dis_101719f5c.s` (`108441`): compute avg line duration for a section
+- `out/dis_10171b690.s` (`108457`): section constructor confirms `type` is at `+0x60` and lines vector storage starts at `+0x80`
+
+Next:
+
+- I still need to locate *where* translations are applied at render time: something has to look at `songInfo + 0x90` (language -> (lineKey -> text)) and choose which text is displayed for each line.
+- I also want to extract the full `TSLLyricsSection::ParseXML` child lambda code (not just the assert string) to pin down the exact offsets for:
+  - `line->mParentSection`
+  - `line->mOriginalLineIndex`
+  - the section’s “songPart” field and the “section type” meaning beyond `8`.
