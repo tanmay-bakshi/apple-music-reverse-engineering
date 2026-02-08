@@ -727,3 +727,566 @@ Next step: run the BL scanner against those addresses, then disassemble the surr
 
 - Who sets `[this+0x178]` flags (bit0 + bit1 meaning).
 - Where responses are parsed and handed off (TTML parse vs plain lyrics).
+
+#### 2026-02-07 18:16-: Trying To Link StoreGetLyrics Into Callers
+
+First I tried the new BL-xref tool directly on the most interesting StoreGetLyricsRequest helpers:
+
+```sh
+python3 scripts/find_arm64_bl_xrefs.py --target 0x100809000 | tee out/bl_xrefs_100809000.txt
+python3 scripts/find_arm64_bl_xrefs.py --target 0x10080906C | tee out/bl_xrefs_10080906C.txt
+python3 scripts/find_arm64_bl_xrefs.py --target 0x100809304 | tee out/bl_xrefs_100809304.txt
+```
+
+Results:
+
+- ctor `0x100809000`: `xrefs=0`
+- param builder `0x10080906C`: `xrefs=0`
+- response parser `0x100809304`: `xrefs=1`
+  - callsite: `0x100809A40`
+
+So the ctor/param builder are likely invoked via:
+
+- inlining (no direct call), and/or
+- vtable dispatch (PAC-ed `blraa`), and/or
+- indirect function pointer calls (`blr`/`blraa`) instead of immediate `bl`.
+
+I disassembled the one parser callsite.
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1008099F0 -c 220 -b -r" \
+  -o quit > out/dis_1008099F0.s 2> out/dis_1008099F0.err
+```
+
+The interesting function here is:
+
+- `0x100809A18` `___lldb_unnamed_symbol44409` (see `out/dis_1008099F0.s`)
+
+High-level behavior of `44409`:
+
+1. It checks `[x0 + 0x28]` and returns early if null.
+2. It sets up an out-struct on the stack at `sp+0x8` and calls the StoreGetLyrics response parser:
+
+   - `bl 0x100809304` (`___lldb_unnamed_symbol44397`)
+
+3. It then loads `[x0 + 0x28]` again, and if non-null, performs a virtual call at vtable offset `0x30` on that object:
+
+   - `ldr x8, [vtable, #0x30]!` then `blraa x8, x17`
+   - It passes `x1 =` the original `x1` argument, and `x2 = sp+0x8` (pointer to the parsed response struct).
+
+My current guess: `44409` is a virtual "deliver response" override for StoreGetLyricsRequest. It parses the response into `StoreGetLyricsRequest::Response` and forwards it to a completion handler object stored at `[this+0x28]`.
+
+I confirmed `44409` is actually in the StoreGetLyricsRequest vtable via fixup-chain details:
+
+- `out/dyld_fixup_chain_details_arm64e.txt` contains:
+  - vtable entry at `0x01DD6E58` -> target `0x00000809A18` with diversity `0x6A0F`
+
+Given the vtable addresspoint is `0x101DD6CA0`, the entry lives at:
+
+- `0x101DD6E58` which is offset `0x1B8` from the vtable addresspoint.
+
+So we have a concrete vtable slot to hunt for in virtual dispatch code.
+
+##### New anchor: LyricsHandler/TSL strings in __cstring
+
+I looked for more lyrics-related cstrings (something I can xref into code).
+
+```sh
+dyld_info -arch arm64e -section __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "mCurrentLyricsHandler|StoreLyrics|LyricsTagParser|TSLLyrics" | head -n 50
+```
+
+Two nice short anchors showed up:
+
+- `mCurrentLyricsHandler`
+- `inHandler == mCurrentLyricsHandler`
+
+I pulled their start addrs via otool (since dyld_info gives NUL addresses):
+
+```sh
+otool -arch arm64e -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "mCurrentLyricsHandler|inHandler == mCurrentLyricsHandler" | head
+```
+
+Start addresses:
+
+- `mCurrentLyricsHandler` at `0x101A76A2E`
+- `inHandler == mCurrentLyricsHandler` at `0x101A76ADB`
+
+Then I xref'd `mCurrentLyricsHandler`:
+
+```sh
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101A76A2E | tee out/adrp_add_xrefs_mCurrentLyricsHandler.txt
+```
+
+Result:
+
+- xref at `0x10118A1EC`
+
+Disassembling around this xref:
+
+- `out/dis_101189C88.s` (function start)
+- `out/dis_10118A160.s` (mid-function region containing the xref)
+
+This string appears inside an assertion-failure reporting path (it builds an error log with `"Assertion failure"` and a message including `"mCurrentLyricsHandler"`), so it's not yet the "main pipeline" but it still gets me into the relevant subsystem.
+
+##### Big discovery: TSLLyricsXMLParser.cpp asserts are embedded as cstrings
+
+I also noticed the binary contains very long assert strings that include:
+
+- actual source file paths (AppleInternal build roots)
+- full condition strings
+- sometimes even large inlined lambda text blobs
+
+Example entries from `dyld_info __cstring`:
+
+- `TSLLyricsTextElement::ParseXML( node, treeNode )`
+- `TSLLyricsViewController::ClearHighlight`
+- many strings pointing at `/.../TSLLyricsXMLParser.cpp` with explicit line numbers
+
+This is a huge opportunity: I can use these as static anchors to locate the TTML/XML parsing entrypoints, then connect that back to the StoreGetLyrics response `"ttml"` path.
+
+Next step: I probably need another small scanner to locate vtable-dispatch sites by their `movk x17, #<diversity>, lsl #48` constants (e.g. `0x75AF` for the param builder slot, `0x6A0F` for the response handler slot, etc.).
+
+---
+
+### 2026-02-07: Lyrics pipeline deep dive (StoreGetLyricsRequest scheduling + callback plumbing)
+
+Context/time sanity:
+
+```sh
+date
+git status -sb
+```
+
+(As of this moment: `Sat Feb  7 19:04:17 EST 2026`, `HISTORY.md` modified, untracked `scripts/find_arm64_movk_xrefs.py`.)
+
+#### Found: LyricsHandler allocates + schedules a StoreGetLyricsRequest
+
+I disassembled a lyrics-ish handler function at:
+
+- `Music` `___lldb_unnamed_symbol86671` @ `0x1011880A0`
+- Disasm: `out/dis_1011880A0.s`
+
+This function looks extremely much like a `LyricsHandler::StartGettingStoreLyrics()` (or the concrete method that creates/schedules the request).
+
+Key behavioral notes:
+
+- Allocates `0x180` bytes via `operator new(size, std::nothrow)`.
+- If allocation fails: bails.
+- Constructs `StoreGetLyricsRequest` with:
+  - `x1 = *(handler + 0x30)` (some store/lyrics id)
+  - `w2 = 2 or 3` based on a config/flag byte: if `*(handler + 0x5) == 0` -> `2`, else `3`.
+  - I saw this implemented with `cinc` (conditional increment).
+- Builds a `shared_ptr` control block (0x20 bytes) and calls a helper that I initially misinterpreted (see below).
+- Stores a shared_ptr-like pair into `*(handler + 0x68)` (likely `mLyricsRequest`).
+- Calls a schedule method on the request.
+
+A few concrete assembly snippets (trimmed to the telling bits):
+
+```asm
+; allocate 0x180 nothrow
+mov     w0, #0x180
+adrp    x1, ___ZSt7nothrow@PAGE
+add     x1, x1, ___ZSt7nothrow@PAGEOFF
+bl      _operator_new(unsigned long, std::nothrow_t const&)
+cbz     x0, <return>
+
+; compute flags 2/3
+ldrb    w8, [x20, #5]
+mov     w2, #2
+cinc    w2, w2, ne
+
+; ctor(this=x0, id=[handler+0x30], flags=w2)
+ldr     x1, [x20, #0x30]
+bl      0x100809000 ; ___lldb_unnamed_symbol44392 (StoreGetLyricsRequest::ctor)
+
+; store request shared_ptr-ish into handler+0x68
+stp     x0, x1, [x20, #0x68]
+
+; schedule request
+mov     x0, x22
+bl      0x1007F5FAC ; ___lldb_unnamed_symbol43916 (StoreRequest::Schedule-like)
+```
+
+This is a big milestone: it confirms the “lyrics fetch” pipeline is implemented as a StoreRequest subtype, allocated from the handler, stored on the handler, then scheduled.
+
+#### Correction: 0x1007F3990 is weak-self initialization + “Created” logging
+
+I previously thought `0x1007F3990` (`___lldb_unnamed_symbol43896`) was the “completion hookup”. That was wrong.
+
+Disasm: `out/dis_1007F3990.s`
+
+What it does:
+
+- Treats `(x0=this=request, x1=&shared_ptr_pair)`.
+- Loads `(ptr, control)` from `*x1`.
+- Atomically increments the count at `[control + 0x10]`.
+- Stores `(ptr, control)` into `[this + 0x8]` (looks like weak-self / enable_shared_from_this storage).
+- Releases any previous weak count via `std::__shared_weak_count::__release_weak()`.
+- Logs a message of the form:
+  - `storereq> %{public}s(%d). Created.`
+  - where the `%{public}s` comes from a virtual “op name” or similar.
+
+This makes `0x1007F3990` feel like a base facility: “the request is now owned by a shared_ptr; store the weak backpointer; emit Created log”.
+
+#### StoreGetLyricsRequest ctor and base init zeroing: explains why +0x28 starts null
+
+`StoreGetLyricsRequest` ctor:
+
+- Address: `0x100809000` `___lldb_unnamed_symbol44392`
+- Disasm: `out/dis_100809000.s`
+
+It calls a base init (`0x1007B5638` `___lldb_unnamed_symbol42007`), then sets fields:
+
+- `[this + 0x170] = id`
+- `[this + 0x178] = flags`
+
+Base init chain:
+
+- `0x1007B5638` -> calls `0x1007F36C8` (`___lldb_unnamed_symbol43891`)
+- Disasm: `out/dis_1007F36C8.s`
+
+The important discovery here: base init explicitly zeroes a 16-byte field at `this + 0x20` via:
+
+- `0x100556794` (`___lldb_unnamed_symbol31464`): `stp xzr, xzr, [x0]`
+- Disasm: `out/dis_100556794.s`
+
+So `*(this + 0x20)` and `*(this + 0x28)` are guaranteed to start out as null pointers.
+
+That matters because the response forwarder (`0x100809A18`) *loads `[request + 0x28]` and bails if null*. Therefore, there MUST be a later path that populates this `(ptr0, ptr1)` pair before responses can be handled.
+
+#### New type insight: `this+0x20` is a 16-byte “pair” of intrusive-refcounted pointers
+
+I disassembled:
+
+- `0x1007484C8` (`___lldb_unnamed_symbol39799`)
+- Disasm: `out/dis_1007484C8.s`
+
+This function assigns a 16-byte structure that looks like:
+
+- two pointers (`ptrA`, `ptrB`)
+- each points to an object with an *intrusive refcount at `[obj + 0x8]`*
+  - atomic inc on assign
+  - atomic dec on overwrite/release
+  - delete if refcount hits 0
+
+This strongly suggests:
+
+- request+0x20 is a “pair of intrusive_ptr-like things”
+- request+0x28 is the second pointer in that pair
+
+So when `StoreGetLyricsResponse` forwarder loads `[req+0x28]`, it’s likely reading the “callback receiver” (or similar) from that intrusive-pair.
+
+#### StoreGetLyricsResponse forwarder re-confirmed (and now interpreted via the pair)
+
+- Forwarder: `0x100809A18` (`___lldb_unnamed_symbol44409`)
+- Disasm: `out/dis_1008099F0.s`
+
+Behavior:
+
+- Parses response (calls `0x1008099F0` region / `___lldb_unnamed_symbol44397`).
+- Loads `x0 = [request + 0x28]`.
+- If `x0 == 0`, returns.
+- Calls virtual method at vtable offset `0x30` on that object (diversity `0x2B6C`) with the parsed response struct.
+
+Now that I know `request+0x28` is part of an intrusive pair, I’m treating it as “the lyrics callback sink” stored elsewhere.
+
+#### 0x100809654 (44398) does NOT set +0x28; it configures a different field (+0x88)
+
+I chased `StoreGetLyricsRequest` method `0x100809654` (`___lldb_unnamed_symbol44398`) and found:
+
+- It constructs some wrapper objects (`44402`, `44401`) and calls:
+  - `0x1007F8FB0` (`___lldb_unnamed_symbol43934`)
+
+`43934` (disasm: `out/dis_1007F8FB0.s`) takes a mutex, checks `[this + 0x128]` (start flag?), and assigns a field at `this + 0x88` via helper functions `44004`/`44003`.
+
+So `44398` is configuring *something*, but it’s the +0x88 slot, not the +0x20/+0x28 pair.
+
+#### Breakthrough: there IS a helper that copies a “pair” into request+0x20 (indirectly populating +0x28)
+
+I found a helper:
+
+- `0x1007F3B40` (`___lldb_unnamed_symbol43899`)
+
+It (under a mutex) assigns `*(this + 0x20) = *(x1)` using the 16-byte-pair assignment helper `39799`.
+
+I then used my BL-xref scanner:
+
+```sh
+python3 scripts/find_arm64_bl_xrefs.py --target 0x1007F3B40
+```
+
+and found only two callsites:
+
+- `0x1007FA9EC`
+- `0x1007FAB4C`
+
+Disasm around them:
+
+- `out/dis_1007FA8D0.s`
+- `out/dis_1007FAA80.s`
+
+Both look like they do:
+
+```asm
+ldr x0, [sp, #0xb0]      ; request-like object
+add x1, x19, #0x20       ; source pair address
+bl  0x1007F3B40          ; copies into req+0x20
+```
+
+So there is a real “set callback pair” API; it just wasn’t the place I expected (`44398`).
+
+Open question: those two callsites don’t yet look lyrics-specific. Next step is to find *lyrics-specific* code that uses either:
+
+- this `43899` setter, or
+- direct calls to `39799` where `x0 = request + 0x20`
+
+I wrote a new scanner (`scripts/find_arm64_movk_xrefs.py`) to help find virtual dispatch sites by their `movk x17, #<diversity>, lsl #48` constants so I can more quickly locate relevant vtable calls and track them back to lyrics-related objects.
+
+#### Follow-up: confirmed StartGettingStoreLyrics sets +0x88 handler, but still no obvious +0x20/+0x28 population
+
+I re-opened the full disassembly for `0x1011880A0` (`out/dis_1011880A0.s`) to make sure I didn’t miss an assignment to the `request+0x20` pair.
+
+Notable additional details I hadn’t captured in my earlier quick snippet:
+
+- After constructing the request + shared_ptr control block, the handler calls `0x1007F3990` (weak-self init + Created log) exactly as expected.
+- Later, it constructs a fairly large stack “callable” object (allocates `0x50` bytes for a heap object with vtable diversity `0x5B4C`, stores various captured fields, including the lyrics id at `[obj+0x48]`).
+- It passes `&stackCallable` into `StoreGetLyricsRequest` method `0x100809654` (`44398`).
+  - Disasm of `44398`: `out/dis_100809654.s`
+  - `44398` only builds a wrapper object with diversity `0x1DA3` and calls `0x1007F8FB0` (`43934`).
+- `43934` is clearly a setter for the request’s field at `this+0x88` (under mutex at `this+0xE0`).
+
+Key conclusion: the LyricsHandler path DOES set up a callback-ish thing, but it lands in the request at `+0x88`, not in the `+0x20/+0x28` intrusive pair that `StoreGetLyricsResponse` forwarder (`44409`) uses.
+
+#### Schedule() also doesn’t seem to set +0x20
+
+I scanned `StoreRequest::Schedule` (`0x1007F5FAC`, disasm `out/dis_1007F5FAC.s`) for any obvious assignment into `this+0x20` / calls into `39799` but didn’t spot it.
+
+This makes it increasingly likely that the `this+0x20` pair is populated by some other request lifecycle phase (possibly “start performing” / “response handler install” code) or via a tailcall wrapper into `39799` that my BL-xref approach doesn’t see (because tailcalls use `b`, not `bl`).
+
+Next tactical move: find *branch* (B) xrefs to `0x1007484C8` (`39799`) to identify wrapper methods like:
+
+```asm
+add x0, x0, #0x20
+b   0x1007484c8
+```
+
+If such a wrapper exists, it will tell me that there is an official “setter” for the `+0x20` pair, which I can then xref to find the actual place where lyrics installs its callback receiver.
+
+#### 2026-02-07 19:10-19:46
+
+This is the “tailcall thunk + lyrics asset data + TTML parser” binge. I’m writing this as close to real-time as possible, but I’m also backfilling a few steps based on the disassembly artifacts I produced in `out/` during this block.
+
+**New tooling: unconditional branch (B) xref scanner**
+
+I implemented a complementary scanner for tailcalls/thunks that use `b` instead of `bl`:
+
+- Script: `scripts/find_arm64_b_xrefs.py`
+- Motivation: lots of tiny wrappers are literally:
+
+```asm
+add x0, x0, #0x20
+b   <real_function>
+```
+
+and my `BL` xref tool won’t see those.
+
+Notable commands during this period:
+
+```sh
+python3 scripts/find_arm64_b_xrefs.py --target 0x1007484C8
+python3 scripts/find_arm64_movk_xrefs.py --imm16 0x670e --rd 17 > out/movk_xrefs_670E_x17.txt
+```
+
+**Major re-interpretation: “current lyrics” global is `shared_ptr` to a lyrics AssetData**
+
+I had previously suspected a global was “current handler”, but the pointer authentication constants told a different story.
+
+In the LyricsHandler response path I saw repeated authentication of a global pointer with:
+
+```asm
+movk x17, #0x670e, lsl #48
+autda x16, x17
+```
+
+This same `0x670e` constant shows up as the vptr-auth constant for the *lyrics asset data* object, not the handler itself. The handler later compares `assetData+0x38` against the handler’s `lyricsId` which strongly implies:
+
+- `assetData + 0x38` = lyricsId
+- the global is a `shared_ptr<AssetData>` for “current lyrics asset data”
+
+**Concrete downstream consumer found: `0x10038E628` (21817)**
+
+After scanning for `movk x17, #0x670e, lsl #48` xrefs, I found a strong consumer:
+
+- Consumer: `0x10038E628` (`___lldb_unnamed_symbol21817`)
+- Disasm: `out/dis_10038E628.s`
+
+Its behavior (high-level):
+
+- Input: `shared_ptr` to the lyrics AssetData.
+- Calls an AssetData virtual at vtable offset `0x10` (diversity `0x7AEA`) to validate / check readiness.
+- Extracts `lyricsId` from `assetData+0x38`.
+- Copies an intrusive-pair from `assetData+0x40`.
+- Extracts a lyrics CFString from `assetData+0x20` via `0x101186AD4` (see below).
+- Parses TTML via `0x101729D98` and stores the result into a field at `this+0x1d0`.
+
+Key snippet (call into TTML parse):
+
+```asm
+; from out/dis_10038E628.s
+bl     0x101186ad4               ; ___lldb_unnamed_symbol86634 (extract CF TTML data)
+...
+add    x8, sp, #0x10             ; sret out
+mov    x0, sp                    ; input wrapper holding CFData*
+bl     0x101729d98               ; ___lldb_unnamed_symbol108718 (TTML parser)
+```
+
+**Lyrics CFString extractor: `0x101186AD4` (86634)**
+
+- Function: `0x101186AD4` (`___lldb_unnamed_symbol86634`)
+- Disasm: `out/dis_101186AD4.s`
+
+This function pulls the “lyricsCFString” out of `assetData+0x20`, asserts it is non-null, and converts it into a CoreFoundation object that downstream code treats as “TTML data”.
+
+**TTML parser identified: `0x101729D98` (108718)**
+
+- Parser: `0x101729D98` (`___lldb_unnamed_symbol108718`)
+- Disasm: `out/dis_101729D98.s`
+
+This is a large routine that:
+
+- Builds/uses a CFXML tree (later asserts `xmlTree != __null`).
+- Produces a `shared_ptr` return value via the arm64 ABI `x8` sret pointer.
+- Post-processes parsed sections/lines and emits warnings like:
+  - `WARNING: Detected missing instrumental section at %g of length %g; inserting section`
+  - `WARNING: Detected missing instrumental section at end of song of length %g; inserting section`
+
+This strongly supports: the lyrics payload is TTML (XML-ish), parsed into an internal model that includes explicit “instrumental” sections when gaps exceed a threshold.
+
+**Wrapper confirms input type: `cfTTMLData != nullptr`**
+
+I found a small wrapper that asserts the input is CoreFoundation “TTML data” and then calls the parser:
+
+- Wrapper: `0x101719484` (`___lldb_unnamed_symbol108432`)
+- Disasm: `out/dis_101719484.s`
+
+Key excerpt:
+
+```asm
+; expects a CF* data object on stack (cfTTMLData != nullptr)
+mov    x8, x19                    ; sret out
+bl     0x101729d98                ; ___lldb_unnamed_symbol108718
+```
+
+The assertion string is literally `"cfTTMLData != nullptr"`, which (combined with the earlier extractor) implies:
+
+- we store lyrics as a CFString somewhere, then convert to CFData for parsing.
+
+**XML enumeration helper: `0x1017296F4` (108714)**
+
+- Function: `0x1017296F4` (`___lldb_unnamed_symbol108714`)
+- Disasm: `out/dis_1017296F4.s`
+
+This helper walks a `CFTreeRef` and uses CFXML APIs:
+
+- `CFTreeGetChildCount`
+- `CFTreeGetChildAtIndex`
+- `CFXMLNodeGetTypeCode`
+
+It’s used as a generic “enumerate children and call callback” primitive. An embedded assert string includes a huge source-level snippet referencing:
+
+- `TSLLyricsXMLParser.cpp`
+- `TSLLyricsLine::ParseXML(...)`
+- `WARNING: Dropping empty line, time span %g - %g`
+
+So there is strong evidence that the TTML parsing implementation is in a component named `TSLLyricsXMLParser` and constructs `TSLLyricsLine` objects.
+
+**RemoteAssetDownloadManager (offline download lyrics) insertion path finally decoded**
+
+Earlier I had a known insertion/log path around:
+
+- `0x10145811C` (`___lldb_unnamed_symbol97647`) containing the string `"radm> lyrics"`
+
+I found the actual higher-level dispatcher `0x101457D3C` (`___lldb_unnamed_symbol97646`) and a thunk:
+
+- Thunk: `0x101458C90` (`___lldb_unnamed_symbol97650`)
+
+Key thunk snippet:
+
+```asm
+sub    x0, x0, #0x100
+b      0x101457d3c               ; ___lldb_unnamed_symbol97646
+```
+
+So this is a classic C++ this-adjusting thunk (likely multiple inheritance / vtable layout).
+
+I then used fixups + movk-xrefs to connect the call sites:
+
+- `out/dyld_fixup_chain_details_arm64e.txt` includes:
+  - `target: 0x00001458C90` (thunk) with diversity `0x398E`
+- `python3 scripts/find_arm64_movk_xrefs.py --imm16 0x398e --rd 17` found the only two call sites:
+  - `0x100ACE660`
+  - `0x100ACE924`
+
+Those call sites are in the “command execution” machinery (`out/dis_100ACE600.s`, `out/dis_100ACE8C0.s`) and invoke a vtable entry with diversity `0x398E`, which resolves to the thunk above, which tailcalls into `97646`.
+
+Within `97647`, there are explicit log strings proving what “radm” means:
+
+- `RemoteAssetDownloadManager::SetDownloadedTrackLyrics: HTTPError: %d`
+- `RemoteAssetDownloadManager::SetDownloadedTrackLyrics: track lyrics insertion error: %d`
+
+So: `"radm> lyrics"` is “RemoteAssetDownloadManager > lyrics”.
+
+At this point, I’m treating the project as having two major lyrics flows:
+
+- **On-the-fly lyrics display flow**:
+  - Store lyrics response -> AssetData -> extract TTML -> parse into `TSLLyrics*` objects -> UI/lyrics model update.
+- **Offline/download lyrics flow**:
+  - RemoteAssetDownloadManager command -> insert downloaded lyrics assets (with HTTP error handling and insertion error logging).
+
+Next immediate task: connect the LyricsHandler “StoreGetLyrics” response path cleanly into the TTML parse consumer chain (I’ve now found at least one direct callsite from the LyricsHandler cluster into the `21815/21817` consumer, so this should be tractable).
+
+#### 2026-02-07 19:46+
+
+I went hunting for where the `21817` consumer is actually invoked from, and found a direct call out of the LyricsHandler cluster.
+
+Commands:
+
+```sh
+python3 scripts/find_arm64_bl_xrefs.py --target 0x10038E3D4
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x101187120 -c 220 -b -r" -o "quit" > out/dis_101187120.s
+```
+
+Findings:
+
+- Caller: `0x101187120` (`___lldb_unnamed_symbol86656`)
+- Disasm: `out/dis_101187120.s`
+
+This function:
+
+- Takes an AssetData-like pointer and calls the virtual at vtable offset `0x10` with diversity `0x7AEA` (same “validate/has-lyrics” check I saw in `21817`).
+- Calls `0x10038E3D4` (`___lldb_unnamed_symbol21815`) which constructs a helper object and then calls the downstream vmethod `21817` (diversity `0x7667`) that extracts TTML and invokes the TTML parser.
+
+Key excerpt:
+
+```asm
+; from out/dis_101187120.s
+movk   x17, #0x670e, lsl #48
+...
+movk   x17, #0x7aea, lsl #48
+blraa  x8, x17                    ; assetData->(v+0x10) “is valid?”
+...
+add    x8, sp, #0x40              ; sret for shared_ptr out of 21815
+add    x0, sp, #0x30
+add    x1, sp, #0x20
+bl     0x10038e3d4                ; 21815 -> calls 21817 -> calls 108718
+```
+
+It also contains assert strings:
+
+- `"inLyrics != nullptr"`
+- `"lyricsEvent != nullptr"`
+- `"playActivityFeed != nullptr"`
+
+So `86656` looks like a lyrics-to-play-activity-feed bridge: it’s invoked when lyrics are available, and it kicks off the “consume AssetData -> parse TTML -> build UI model” chain.
