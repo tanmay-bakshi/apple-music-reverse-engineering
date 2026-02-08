@@ -2476,3 +2476,116 @@ This also retroactively makes the `0x10038E9AC` consumer make more sense:
 Next:
 
 - Find where the “flattened plain lyrics string” lives (it’s not `songInfo + 0x50`). That likely comes from walking `TSLLyricsLine`/`TSLLyricsWord` or a dedicated “flatten” helper (`108433` looked like a newline join).
+
+#### 2026-02-07 22:05-: `TSLLyricsLine::ParseXML` stores `itunes:key` into `line + 0xC0` (confirming the line-key linkage for translations)
+
+I wanted to re-ground the “line key” hypothesis with actual parse code for `<p>` (line) nodes.
+
+I searched for the literal string `"itunes:key"` in disassembly artifacts.
+
+Command:
+
+```sh
+rg -n "itunes:key" out/dis_*.s | head
+```
+
+That pointed at `out/dis_1017294a4.s`, so I opened it.
+
+Command:
+
+```sh
+sed -n '1,120p' out/dis_1017294a4.s
+```
+
+Result: `___lldb_unnamed_symbol108713` @ `0x1017294A4` is a `ParseXML` for a line object (this pointer in `x20`), and it does exactly what I previously inferred:
+
+1) Calls the base `TSLLyricsTextElement::ParseXML` (`108711` @ `0x101729048`) first.
+2) Looks up the attribute `"itunes:key"`.
+3) Stores that attribute value into `this + 0xC0` as an `ITString`.
+
+Relevant snippet:
+
+```asm
+; out/dis_1017294a4.s
+0x1017294d8:  bl     0x101729048               ; 108711: TSLLyricsTextElement::ParseXML
+; ...
+0x1017294e0:  adrp   x1, ... ; "itunes:key"
+0x1017294fc:  bl     0x101728b9c               ; 108708: attribute lookup
+0x101729500:  add    x0, x20, #0xc0            ; this + 0xC0
+0x101729508:  bl     0x1007483b0               ; 39796: ITString store/copy
+```
+
+So the “line key” is *definitively* an `ITString` member at `TSLLyricsLine + 0xC0`.
+
+This pairs extremely cleanly with the translation side:
+
+- Translation `<text>` reads attribute `for="..."` into `TSLLyricsTranslationText + 0x70`.
+- `TSLLyricsTranslation::ParseXML` inserts `mTranslationMap[ line->mLyricsLineKey ] = line->mLyricsText;`.
+
+So I’m now fully convinced the translation pipeline links to base lyrics lines using:
+
+- Original line key: `itunes:key="..."`
+- Translation key ref: `<text for="...">...</text>`
+
+Next:
+
+- Map where the line’s *text content* lives (likely inherited from `TSLLyricsTextElement`, possibly around `+0x60` given constructor patterns in `108462`) so we can be precise about “lyrics text” vs “key” fields.
+
+#### 2026-02-07 23:22-: Translation `<text>` insertion lambda reveals `mLyricsText` offset (`+0x60`) and confirms the map assignment shape in raw code
+
+Local time check:
+
+```sh
+date
+# Sat Feb  7 23:22:04 EST 2026
+```
+
+I wanted to answer the “where does `line->mLyricsText` actually live?” question concretely, and I realized I already had the full disassembly for `TSLLyricsTranslation::ParseXML` (`out/dis_10172d098.s`).
+
+So instead of guessing based on inheritance, I dug into the specific child lambda in that file that:
+
+1) allocates `TSLLyricsTranslationText`,
+2) calls `line->ParseXML(...)`,
+3) does `mTranslationMap[key] = value`.
+
+Commands:
+
+```sh
+# Locate the child lambda body (it’s embedded in the same file as ParseXML)
+rg -n \"#0x70\\b|#0x60\\b\" out/dis_10172d098.s | head -200
+
+# Read the hot area around the map insert + copy
+sed -n '180,300p' out/dis_10172d098.s
+sed -n '260,380p' out/dis_10172d098.s
+```
+
+Result: in `___lldb_unnamed_symbol108856` (inside `out/dis_10172d098.s`), right after `line->ParseXML(tNode, tTreeNode)` succeeds, the code literally does:
+
+- `x1 = line + 0x70` as the map key (`mLyricsLineKey`)
+- `x1 = line + 0x60` as the mapped value source (`mLyricsText`)
+- and it writes into the map node’s value slot at `node + 0x30`
+
+Relevant snippet:
+
+```asm
+; out/dis_10172d098.s
+; after line->ParseXML(...) succeeds:
+0x10172d484: add    x1, x20, #0x70            ; &line->mLyricsLineKey (ITString)
+...
+0x10172d4a0: bl     0x10171bc58               ; 108469: map find/insert helper (returns node ptr)
+0x10172d4a4: add    x0, x0, #0x30             ; &node->mapped_value (ITString)
+0x10172d4a8: add    x1, x20, #0x60            ; &line->mLyricsText (ITString)
+0x10172d4ac: bl     0x1007484c8               ; 39799: ITString assign/copy
+```
+
+So: `TSLLyricsTranslationText::mLyricsText` is at offset `+0x60`, and `TSLLyricsTranslationText::mLyricsLineKey` is at offset `+0x70`.
+
+That strongly implies (and matches the ctor patterns) that the base `TSLLyricsTextElement`’s “text content” `ITString` is at `+0x60`, and translation-text just adds the line-key field at `+0x70`.
+
+Immediate implications:
+
+- For `TSLLyricsLine` (which calls `TSLLyricsTextElement::ParseXML` first), the actual line’s text content is almost certainly the inherited `ITString` at `line + 0x60`.
+- The translation pipeline linkage is now fully pinned down with offsets:
+  - base line key: `TSLLyricsLine + 0xC0` (from `itunes:key`)
+  - translation ref key: `TSLLyricsTranslationText + 0x70` (from `for=`)
+  - translated text content: `TSLLyricsTranslationText + 0x60`
