@@ -1954,3 +1954,161 @@ Store TTML string -> opaque lyrics object -> CreateFromTTML -> CFXML tree -> Enu
   - songwriters/translations from head metadata
   - duration + sections(div) + lines(p) from body
     - line begin/end + itunes:key + words from nested nodes
+
+#### 2026-02-07 21:24-
+
+Quick pause to sanity-check the timeline in this notebook, and then continue digging into the TTML `<head>` metadata path (especially songwriters + translations).
+
+##### HISTORY.md date check (local time)
+
+I’m being extra paranoid here because I previously wrote a bad header while reasoning quickly.
+
+Commands:
+
+```sh
+date
+rg -n "2026-02-0[89]" HISTORY.md
+```
+
+Observed:
+
+- `date` shows `Sat Feb  7 21:24:17 EST 2026` (so this session is still on Feb 7, not Feb 8).
+- There are **no** `2026-02-08` timeline headers; the only mentions are in my own logged `rg` commands.
+
+##### Mapping the nested `<iTunesMetadata>` lambdas for `<songwriters>` / `<translations>`
+
+I already had the “big picture” from the giant embedded assert strings, but I wanted to nail down the *actual* call operators for the deep nested lambdas so we can extract object layouts and exact offsets.
+
+The `iTunesMetadata` child-enumerator lambda is `___lldb_unnamed_symbol108819` @ `0x10172C22C` (from `out/dis_10172bd94.s`):
+
+- It checks the node name:
+  - `"songwriters"` -> enumerates children with another lambda
+  - `"translations"` -> enumerates children with another lambda
+  - anything else -> `return true` (ignore)
+
+The tricky part is: those child lambdas are referenced only via vtables (created on the stack), so I pulled their operator() addresses out of the vtables.
+
+Commands:
+
+```sh
+# Decode the adrp targets for the vtables and read the vtable entries.
+python3 - <<'PY'
+def decode_adrp(instr: int, pc: int) -> int:
+    immlo: int = (instr >> 29) & 0x3
+    immhi: int = (instr >> 5) & 0x7FFFF
+    imm: int = (immhi << 2) | immlo
+    if ((imm >> 20) & 1) == 1:
+        imm -= 1 << 21
+    page: int = pc & ~0xFFF
+    return (page + (imm << 12)) & 0xFFFFFFFFFFFFFFFF
+
+# The relevant adrp in the 108819 body is 0x90004270, and one PC site is 0x10172C350.
+print(hex(decode_adrp(0x90004270, 0x10172C350)))
+PY
+
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "memory read --format x --size 8 --count 24 0x101F78200" \
+  -o "memory read --format x --size 8 --count 24 0x101F782F8" \
+  -o quit
+```
+
+Results:
+
+- vtable address-point `0x101F78200` corresponds to the `<songwriters>` child lambda.
+  - vtable entry @ `+0x30` (index 6) points at `0x10172C53C` (`___lldb_unnamed_symbol108828`)
+- vtable address-point `0x101F782F8` corresponds to the `<translations>` child lambda.
+  - vtable entry @ `+0x30` (index 6) points at `0x10172CAC8` (`___lldb_unnamed_symbol108842`)
+
+I disassembled both into new artifacts:
+
+- `out/dis_10172c53c.s` (songwriter-node lambda operator)
+- `out/dis_10172cac8.s` (translation-node lambda operator)
+
+###### Writer node lambda: `___lldb_unnamed_symbol108828` @ `0x10172C53C`
+
+High level behavior:
+
+- Expects each child under `<songwriters>` to be `<songwriter>`.
+  - if nodeText != `"songwriter"`: logs assertion `writerNodeText.IsEquivalent( kXMLElementSongwriter )` and returns `false`.
+- Allocates `TSLLyricsSongWriter` with `new (std::nothrow)` size `0x58`.
+- Calls `writer->ParseXML(writerNode, writerTreeNode)` via vtable slot `+0x18`.
+  - on failure: logs assertion `writer->ParseXML( writerNode, writerTreeNode )` and returns `false`.
+- On success: pushes `writer` into `songInfo->mSongwriters` (a `std::vector` of `shared_ptr`-ish pairs).
+
+Key excerpt showing the strict node-name check (compare returns 0 on match):
+
+```asm
+; out/dis_10172c53c.s
+adrp   x1, ... ; "songwriter"
+mov    x0, sp
+bl     0x100747d98               ; 39785: ITString = "songwriter"
+mov    x0, x19                   ; nodeText
+mov    x1, sp
+mov    w2, #0x1b1
+bl     0x10074a03c               ; 39827: compare
+cbz    w19, <match>              ; match when compare == 0
+; else -> assertion + return false
+```
+
+Key excerpt showing `ParseXML` as a vcall at `+0x18`:
+
+```asm
+; out/dis_10172c53c.s
+ldr    x16, [x20]                ; writer vtable
+autda  x16, ...
+ldr    x8, [x16, #0x18]!
+mov    x0, x20                   ; writer
+mov    x1, x21                   ; writerNode (CFXMLNodeRef)
+mov    x2, x23                   ; writerTreeNode (CFTreeRef)
+blraa  x8, ...
+tbz    w0, #0x0, <fail>          ; bool return
+```
+
+Very useful layout inference: this lambda captures `songInfo` by reference (`[&]`), so the capture is a `TSLLyricsSongInfo**` (pointer to the local `songInfo` pointer).
+
+When pushing into `songInfo->mSongwriters`, the vector’s fields appear at:
+
+- `songInfo + 0x28` = begin
+- `songInfo + 0x30` = end
+- `songInfo + 0x38` = end_cap
+
+I’m inferring that from the push_back logic:
+
+- fast path writes at `end`, advances `end`, stores updated `end` back to `[songInfo + 0x30]`
+- slow path reads begin from `[songInfo + 0x28]`, reallocates, then stores begin/end/end_cap back to `0x28/0x30/0x38`
+
+###### Translation node lambda: `___lldb_unnamed_symbol108842` @ `0x10172CAC8`
+
+High level behavior:
+
+- Expects each child under `<translations>` to be `<translation>`.
+  - if nodeText != `"translation"`: logs assertion `transNodeText.IsEquivalent( kXMLElementTranslation )` and returns `false`.
+- Allocates `TSLLyricsTranslation` with `new (std::nothrow)` size `0x60`.
+- Calls `translation->ParseXML(transNode, transTreeNode)` via vtable slot `+0x18`.
+  - on failure: logs assertion `translation->ParseXML( transNode, transTreeNode )` and returns `false`.
+- On success, it effectively implements:
+
+  `songInfo->mTranslationsMap[ translation->mLanguage ] = translation->mTranslationMap;`
+
+Two particularly nice offset hints fall out of the machine code:
+
+- It takes the key from `translation + 0x38` (looks like `translation->mLanguage`).
+- The destination map lives at `songInfo + 0x90` (looks like `songInfo->mTranslationsMap`).
+
+Key excerpt:
+
+```asm
+; out/dis_10172cac8.s
+ldr    x8, [x21, #0x8]            ; capture (&songInfo)
+ldr    x8, [x8]                   ; songInfo*
+add    x1, x22, #0x38             ; &translation->mLanguage
+add    x0, x8, #0x90              ; &songInfo->mTranslationsMap
+bl     0x10171bacc                ; 108466: map operator[] / find+insert style helper
+```
+
+After the `108466` call, there’s a long loop that walks `translation->mTranslationMap` and inserts/copies into the returned destination map entry (so the value type is almost certainly itself a map/tree-like container, not a flat scalar).
+
+Next: disassemble `0x10171BACC` (`108466`) and the `108874/108875` helpers (`0x10172D9AC` / `0x10172DA24`) to get a clearer idea of:
+
+- what type `mTranslationsMap` is (std::map vs unordered_map vs custom)
+- what the inner “translation map” key/value types are
