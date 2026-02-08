@@ -1517,3 +1517,177 @@ Observed:
 - Local machine time is `Sat Feb  7 20:26:46 EST 2026`.
 - No remaining `2026-02-08` headers in `HISTORY.md` (so the timeline is aligned to *local* time again).
 - `HISTORY.md` had uncommitted additions (the CFURL validation notes appended above) and should be committed before continuing.
+
+#### 2026-02-07 20:30-20:45
+
+Goal: finish nailing down the *exact* query parameter keys added by `StoreGetLyricsRequest::AddParameters` (the earlier disasm annotated one key as `"'l'"` which looked suspicious).
+
+##### Confirming the `l` param key (language)
+
+From `out/dis_10080906C.s` (AddParameters at `0x10080906C`), I saw:
+
+- key `"id"` (track/store Adam ID?)
+- key `"l"` (locale/language string, sourced from `0x1007576F0` / `40123`)
+- key `"itre"` (boolean 0/1 derived from `[this+0x178]` bit0)
+
+LLDB’s comment showed `"'l'"`, but I suspected it was just “repr of a 1-char string”, not an apostrophe-containing literal.
+
+Commands:
+
+```sh
+# Find the VM addresses of the cstrings (otool prints address + decoded string)
+otool -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "  itre$" 
+otool -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "0000000101a323df" || true
+```
+
+Results:
+
+- `"itre"` is at `0x0000000101A328E8`
+- the single-letter key is indeed `"l"` at `0x0000000101A323DF`
+
+So `StoreGetLyricsRequest` adds a `l=<locale>` query parameter where `<locale>` comes out of `40123`.
+
+##### Finding other code that uses `itre`
+
+Commands:
+
+```sh
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101A328E8
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1007F10F0 -c 140 -b -r" -o quit > out/dis_1007F10F0.s
+```
+
+Xrefs reported by the script:
+
+- `0x100809140` (lyrics `AddParameters`)
+- `0x1007F1120` (inside `___lldb_unnamed_symbol43810`)
+
+The `43810` snippet suggests `itre` is part of a broader “store platform request” parameter/header bundle (not lyrics-specific). It also references `"itrv"` (same cstring neighborhood as `itre`).
+
+Key excerpt:
+
+```asm
+; out/dis_1007F10F0.s
+adrp   x1, ...
+add    x1, x1, #0x8e8            ; "itre"
+...
+ldrb   w8, [x20, #0x1a4]
+str    w8, [sp, #0x8]
+...
+bl     0x1002688fc               ; wraps the value as a CFNumber/CFType-ish
+...
+adrp   x1, ...
+add    x1, x1, #0x8ed            ; "itrv"
+...
+```
+
+So: `itre` likely means some iTunes/store environment knob (exact semantics TBD), and lyrics is just reusing the same convention.
+
+#### 2026-02-07 20:45-21:10
+
+Big milestone: found where the `StoreGetLyricsRequest` `id` (`+0x170`) and `flags` (`+0x178`) fields are *set*, and the primary callsite that constructs/schedules the request.
+
+##### Finding the constructor that writes `+0x170` / `+0x178`
+
+I had already inferred from `AddParameters` that:
+
+- `[this+0x170]` is the ID used for the query param `id=...`
+- `[this+0x178]` is a flags bitfield (bit0 -> `itre`, bit1 -> TTML bag key)
+
+So I disassembled a chunk around the `StoreGetLyricsRequest` code region and grepped for those offsets.
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x100808000 -c 3200 -b -r" -o quit > out/dis_100808000_3200.s
+
+rg -n "#0x170|#0x178" out/dis_100808000_3200.s | head
+```
+
+Key hit: `___lldb_unnamed_symbol44392` at `0x100808FF4`.
+
+It looks like the real `StoreGetLyricsRequest` ctor taking `(id, flags)`:
+
+```asm
+; out/dis_100808000_3200.s
+Music`___lldb_unnamed_symbol44392:
+...
+mov    x19, x2                  ; flags
+mov    x20, x1                  ; id
+bl     0x1007b5638              ; base StoreRequest-ish ctor
+...
+str    x20, [x0, #0x170]        ; this->mId = id
+str    w19, [x0, #0x178]        ; this->mFlags = flags
+retab
+```
+
+So `+0x170` is indeed the ID field and `+0x178` is the flags field.
+
+##### Finding who calls that ctor (looks like `LyricsHandler::StartGettingStoreLyrics`)
+
+Next, I asked: who calls `0x100808FF4`?
+
+Commands:
+
+```sh
+python3 scripts/find_arm64_bl_xrefs.py --target 0x100808FF4
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x101188190 -c 260 -b -r" -o quit > out/dis_101188190.s
+```
+
+Only xref:
+
+- `0x101188248: bl 0x100808FF4`
+
+The surrounding code very strongly looks like `LyricsHandler::StartGettingStoreLyrics`:
+
+- it references an assert string `"mLyricsRequest"`
+- it stores a `shared_ptr`-shaped pair into `[this + 0x68]` / `[this + 0x70]`
+
+The ctor call site (trimmed) is:
+
+```asm
+; out/dis_101188190.s
+ldr    x22, [x20, #0x30]        ; id (likely current track storeAdamID)
+...
+ldrb   w23, [x0, #0x5]          ; some config bool
+cmp    w23, #0x0
+mov    w8, #0x2
+cinc   w2, w8, ne               ; flags = 0x2 if w23==0 else 0x3
+mov    x0, x21                  ; this = newly allocated StoreGetLyricsRequest (size 0x180)
+mov    x1, x22                  ; id
+bl     0x100808ff4              ; StoreGetLyricsRequest(id, flags)
+```
+
+This is hugely informative:
+
+- flags is always `0x2` or `0x3`.
+- bit1 (`0x2`) is always set, meaning the request always chooses the TTML bag key `bag://musicSubscription/ttmlLyrics`.
+- bit0 (`0x1`) is conditional; when set, `AddParameters` sends `itre=1`, otherwise `itre=0`.
+
+I also confirmed the bag-key selection logic in `0x100809754` (`44399`): it chooses `ttmlLyrics` iff `(flags & 0x2) != 0`.
+
+##### What is the `w23` config bit?
+
+The `w23` bit comes from `0x101090124` (`82395`), which returns a pointer to something like a global app context (it asserts `gAppContext != nullptr`). The bool is read from offset `+0x5` in that struct.
+
+I haven't identified the semantic name for that field yet, but it's clearly controlling the `itre` behavior.
+
+#### 2026-02-07 20:53-
+
+Quick sanity check on the date/timeline after a human review comment (they noticed I had briefly written `2026-02-08` earlier, but local time is still the 7th).
+
+Commands:
+
+```bash
+date
+rg -n "2026-02-08" HISTORY.md
+```
+
+Observed:
+
+- `date` shows: `Sat Feb  7 20:53:40 EST 2026`
+- There are **no** `2026-02-08` section headers anymore; the only remaining mentions are in my own logged command output about checking for them.
+
+Next: continue from the `StoreGetLyricsRequest` plumbing into the **completion lambda** inside the lyrics handler, and then follow the TTML bytes into whatever parses it (`TSLLyricsSongInfo::CreateFromTTML` or similar) and ultimately updates the now-playing lyrics view.
