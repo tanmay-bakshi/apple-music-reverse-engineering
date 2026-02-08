@@ -2325,3 +2325,92 @@ Open questions / immediate follow-ups:
 
 - What exactly is `songInfo + 0x50`? I should locate writes to that offset inside `CreateFromTTML` (or its callees), or search for other consumers that read the same offset.
 - What is the type of the upstream “lyrics object” passed into `86634` (the thing that has `ITString` at `+0x20` and another 32-bit field at `+0x34` read earlier in `21817`)?
+
+#### 2026-02-07 21:56-: `TSLLyricsSongInfo` constructor confirms `+0x50` is an `ITString` member (and more context from `CreateFromTTML` + `108914`)
+
+I wanted to get more certainty about what lives at `songInfo + 0x50` beyond “some consumer reads it as an ITString”.
+
+So I disassembled the constructor that `CreateFromTTML` calls right after `operator new(0xA8, nothrow)`.
+
+Commands / artifacts:
+
+```sh
+# Disassemble CreateFromTTML itself (large, but useful for seeing the initial allocation + ctor call)
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x101729d98 -c 900 -b -r" -o quit > out/dis_101729d98.s
+
+# Disassemble the constructor it calls (0xA8-sized object)
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10171b5c8 -c 260 -b -r" -o quit > out/dis_10171b5c8.s
+
+# I also started pulling the longer caller function that uses CreateFromTTML inside 108914:
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x1017301c0 -c 1400 -b -r" -o quit > out/dis_1017301c0_full.s
+```
+
+##### `TSLLyricsSongInfo` ctor (`108456` @ `0x10171B5C8`): `+0x40` and `+0x50` are both `ITString` fields
+
+From `out/dis_10171b5c8.s`:
+
+```asm
+; out/dis_10171b5c8.s
+0x10171b618 <+80>:  add    x0, x0, #0x40
+0x10171b61c <+84>:  bl     0x100556794               ; 31464: ITString default ctor
+
+0x10171b620 <+88>:  add    x0, x19, #0x50
+0x10171b624 <+92>:  bl     0x100556794               ; 31464: ITString default ctor
+```
+
+So the consumer reading `songInfo + 0x50` is absolutely reading a real member field (not some coincidental pointer math).
+
+Other ctor corroborations (nice consistency checks with earlier notes):
+
+- `songInfo + 0x28/+0x30/+0x38` is the songwriters vector (initialized to `{0,0,0}`).
+- `songInfo + 0x90` is the translations map, with its header/sentinel node at `songInfo + 0x98`:
+
+```asm
+; out/dis_10171b5c8.s
+0x10171b62c <+100>: mov    x8, x19
+0x10171b630 <+104>: str    xzr, [x8, #0x98]!          ; zero header node @ +0x98
+...
+0x10171b640 <+120>: str    x8, [x19, #0x90]           ; map header pointer @ +0x90
+```
+
+So the offsets I inferred earlier from the translation/songwriter lambdas match the ctor exactly.
+
+##### `CreateFromTTML` (`108718` @ `0x101729D98`) allocates `0xA8` and calls `108456`
+
+Early in `out/dis_101729d98.s`:
+
+```asm
+0x101729e0c <+116>: mov    w0, #0xa8                  ; =168
+0x101729e10 <+120>: bl     0x1017f7574               ; operator new(nothrow)
+0x101729e20 <+136>: bl     0x10171b5c8               ; 108456 ctor
+```
+
+##### `108914` also calls `CreateFromTTML` and then uses `songInfo + 0x18` to update the upstream lyrics object’s `+0x34`
+
+While scrolling through `out/dis_1017301c0_full.s`, I hit a section where it:
+
+1) Parses the TTML via `86634` -> `CreateFromTTML` (return `std::shared_ptr<TSLLyricsSongInfo>` at `[sp+0x30]`).
+2) Later loads `songInfo` from `[sp+0x30]`, reads `w12 = [songInfo + 0x18]`, and stores that into `w12 -> [lyricsObj + 0x34]` (where `lyricsObj = [x20]`).
+
+Snippet (from `out/dis_1017301c0_full.s`):
+
+```asm
+; out/dis_1017301c0_full.s
+0x1017305bc <+1020>: ldr    x11, [x20]                ; lyricsObj
+0x1017305c0 <+1024>: ldr    x10, [sp, #0x30]          ; songInfo (shared_ptr.get())
+0x1017305c8 <+1032>: ldr    w12, [x10, #0x18]         ; songInfo->(field at +0x18)
+0x1017305d8 <+1048>: str    w12, [x11, #0x34]         ; lyricsObj->(field at +0x34)
+```
+
+This is cool for two reasons:
+
+- It connects the upstream lyrics “holder” object’s `+0x34` field (seen in `21817`) to a concrete field inside `TSLLyricsSongInfo` (`+0x18`), so that upstream object is definitely being “enriched” with parse-derived state.
+- `TSLLyricsSongInfo + 0x18` is initialized to `1` in the ctor, but `CreateFromTTML` likely updates it depending on what it finds in the TTML (I saw a lot of logic in `108718` that appears to set a `w?` into `[somePtr + 0x18]` while iterating structures).
+
+Next:
+
+- Find where `TSLLyricsSongInfo + 0x50` gets populated during parsing (probably in a callee of `CreateFromTTML`, since `108718` itself doesn’t obviously touch that offset in the initial 900-instruction dump).
+- Keep mining `108914` for actual “consumer logic” that might reference `mTranslationsMap` (offset `+0x90`) or per-line keys.
