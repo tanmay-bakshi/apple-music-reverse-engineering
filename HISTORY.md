@@ -1691,3 +1691,266 @@ Observed:
 - There are **no** `2026-02-08` section headers anymore; the only remaining mentions are in my own logged command output about checking for them.
 
 Next: continue from the `StoreGetLyricsRequest` plumbing into the **completion lambda** inside the lyrics handler, and then follow the TTML bytes into whatever parses it (`TSLLyricsSongInfo::CreateFromTTML` or similar) and ultimately updates the now-playing lyrics view.
+
+#### 2026-02-07 21:05-
+
+##### Tracing the Store lyrics completion lambda (from vtable slot to UI update)
+
+Goal: bridge the gap from `StoreGetLyricsRequest::Response` (ttml string) into the on-screen lyrics pipeline.
+
+I started from the wrapper invoke I previously identified (`0x100809A18` / `44409`) which calls the user callback via a vcall at `vtable + 0x30`. So the plan was:
+
+1. find the callback object's vtable
+2. read the entry at `+0x30` to get the callback function address
+3. disassemble that and follow what it does
+
+Commands I ran (high level):
+
+```bash
+nl -ba out/dis_1011880A0.s | sed -n '140,240p'
+python3 - <<'PY'
+# decode ADRP at 0x101188354 (0xB0006B90) -> page; add 0xFB0 + 0x10
+PY
+lldb -o "target create /System/Applications/Music.app/Contents/MacOS/Music" \
+  -o "memory read --format x --size 8 --count 16 0x101ef9fc0" -o quit
+lldb -o "target create /System/Applications/Music.app/Contents/MacOS/Music" \
+  -o "disassemble -s 0x1011889b4 -c 260 -b -r" -o quit > out/dis_1011889b4.s
+```
+
+Key result: the callback target object allocated in `___lldb_unnamed_symbol86671` has its vtable address-point at:
+
+- vtable address-point = `0x101EF9FC0` (computed from ADRP `0xB0006B90` @ `0x101188354` + `0xFB0 + 0x10`)
+
+Reading the vtable entry at offset `+0x30` (index 6) yields a signed function pointer whose *low* 32 bits point at:
+
+- callback operator() = `0x1011889B4` (`___lldb_unnamed_symbol86694`)
+
+That function signature matches exactly what `44409` passes:
+
+- `x0`: callback object ("this")
+- `x1`: error
+- `x2`: `StoreGetLyricsRequest::Response*`
+
+From `out/dis_1011889b4.s` (trimmed):
+
+```asm
+; ___lldb_unnamed_symbol86694 @ 0x1011889B4
+mov    x21, x2                 ; Response*
+mov    x19, x1                 ; error
+mov    x20, x0                 ; callback object
+
+ldrb   w1, [x2, #0x10]         ; Response.isTTML flag (set by 44397 when "ttml" non-empty)
+add    x8, sp, #0x28
+mov    x0, x2
+bl     0x101186cbc             ; ___lldb_unnamed_symbol86636(response, isTTML, &out_shared_ptr)
+
+; copies Response.lyricsId into object field at +0x40
+ldr    x8, [sp, #0x28]
+add    x0, x8, #0x40
+add    x1, x21, #0x18
+bl     0x1007484c8
+
+; stores captured "song id" into object field at +0x38
+ldr    x8, [sp, #0x28]
+ldr    x9, [x20, #0x48]
+str    x9, [x8, #0x38]
+
+; dispatch_async_f(queue, context, work_fn)
+mov    w0, #0x28
+bl     operator new
+...
+bl     dispatch_async_f
+```
+
+So the callback does *not* parse TTML immediately. It:
+
+- creates a shared_ptr-wrapped object (size `0x50`) that holds:
+  - the lyrics text (copied from `Response.text`),
+  - a `isTTML` byte,
+  - the store song id (`+0x38`),
+  - the lyrics id (`+0x40`),
+- then enqueues an async continuation (`___lldb_unnamed_symbol86698` @ `0x101188BDC`) with that context object.
+
+The dispatch continuation (`___lldb_unnamed_symbol86698`) does the state update / signaling:
+
+- locks a weak/shared pair from the context (so it can safely reference the lyrics handler)
+- clears `mLyricsRequest` on the handler (`stp xzr, xzr, [x20, #0x68]`)
+- if there is an error object in the context, calls a handler vfunc (`vtable + 0x68`) with the error (and returns)
+- else, stores the shared_ptr lyrics object into handler offsets `+0x80/+0x88` (looks like `mLyricsSongInfo`), and calls the same vfunc with `nullptr` to signal success
+
+This answered a big question: the Store response’s TTML is initially treated as *opaque data*, and TTML parsing likely happens later (or lazily) from that stored object.
+
+##### Found the TTML parse entrypoint: `TSLLyricsSongInfo::CreateFromTTML`
+
+I suspected there’d be a named entrypoint for TTML parsing and got a huge hint from `strings`:
+
+```bash
+strings -a /System/Applications/Music.app/Contents/MacOS/Music | rg -n "CreateFromTTML|cfTTMLData|setTTML:" | head
+```
+
+This includes multiple demangled-ish strings for:
+
+- `TSLLyricsSongInfo::CreateFromTTML(const __CFData*)`
+- plus an assertion string: `cfTTMLData != nullptr`
+
+I then located that assertion string in `__TEXT,__cstring`:
+
+```bash
+otool -v -s __TEXT __cstring /System/Applications/Music.app/Contents/MacOS/Music | rg -n "cfTTMLData != nullptr"
+```
+
+Result:
+
+- `"cfTTMLData != nullptr"` is at VM addr `0x101AA735E`.
+
+Then I used my ADRP+ADD xref scanner to find where that string is referenced:
+
+```bash
+python3 scripts/find_arm64_adrp_add_xrefs.py --target 0x101aa735e
+```
+
+Result: a single xref inside a function at `0x101719568`.
+
+Disassembling that region (`out/dis_101719480.s`), I found a very plausible TTML parse helper (`___lldb_unnamed_symbol108432` @ `0x101719484`) that:
+
+- takes some input object, extracts a `CFDataRef` into `sp+0x8`
+- asserts/logs if it’s null (`cfTTMLData != nullptr`)
+- otherwise creates some CF object via `0x1006E2A00` (looks like an internal “create CFXML tree from data” helper), then calls `0x101729D98` to continue processing
+
+The interesting (and slightly funny) part: the assertion log path uses an unrelated-looking format string:
+
+```asm
+; ___lldb_unnamed_symbol108432 @ 0x101719548+
+add    x8, x8, #0x35e          ; "cfTTMLData != nullptr"
+...
+add    x3, x3, #0xff4          ; "Performance shaders not available on this device. Resorting to fallback for effects."
+bl     _os_log_error_impl
+```
+
+This smells like either a shared logging helper or a reused string constant; either way, the presence of `cfTTMLData != nullptr` in this function makes it a very likely part of the TTML decode path.
+
+Next: keep walking `___lldb_unnamed_symbol108432` (0x101719484) into `___lldb_unnamed_symbol108718` (0x101729D98) and the large helper (`___lldb_unnamed_symbol108433` @ 0x1017195D0) to understand how the CFXML tree is traversed and how timestamps/lines are extracted.
+
+##### TTML XML Parser Deep Dive (TSLLyricsXMLParser.cpp leaked strings + function graph)
+
+Time window: ~21:05-21:17.
+
+I went further and it turns out the binary contains **massive** debug/assert strings that basically include large chunks of the original C++ lambdas (including file paths and line numbers).
+
+Key commands:
+
+```bash
+# Find callsites to the TTML entrypoint (108432 @ 0x101719484)
+python3 scripts/find_arm64_bl_xrefs.py --target 0x101719484
+
+# Disassemble the TTML callsite and parser helpers
+lldb -o "target create /System/Applications/Music.app/Contents/MacOS/Music" \
+  -o "disassemble -s 0x101186b80 -c 260 -b -r" -o quit > out/dis_101186b80.s
+
+# Disassemble key parser functions
+lldb ... -o "disassemble -s 0x1017294a4 -c 520 -b -r" -o quit > out/dis_1017294a4.s
+lldb ... -o "disassemble -s 0x101728e04 -c 520 -b -r" -o quit > out/dis_101728e04.s
+lldb ... -o "disassemble -s 0x101728ef0 -c 520 -b -r" -o quit > out/dis_101728ef0.s
+```
+
+###### The missing bridge: the Store lyrics object calls into `CreateFromTTML`
+
+The only BL xref to `0x101719484` (`108432`) is:
+
+- callsite: `0x101186C5C`
+
+That’s inside `___lldb_unnamed_symbol86635` (`out/dis_101186b80.s`), which appears to be a method on the *opaque* lyrics object created in the Store completion callback (the one storing TTML as an `ITString` + `isTTML` byte).
+
+Trimmed key path:
+
+```asm
+; ___lldb_unnamed_symbol86635 @ 0x101186c0c
+; vcall at vtable+0x18 returns the isTTML byte (matches vtable entry 86643 -> ldrb w0, [x0,#0x30])
+ldr    x16, [x20]
+...    autda ...
+ldr    x8, [x16, #0x18]!
+blraa  x8, x17                 ; returns w0
+cbz    w0, fallback
+
+; parse TTML (ITString at this+0x20) into a shared_ptr<...> via 108432
+add    x0, x20, #0x20
+mov    x8, sp
+bl     0x101719484             ; ___lldb_unnamed_symbol108432
+
+; if result non-null, continue with 108433
+ldr    x21, [sp]
+cbz    x21, skip
+mov    x8, x19
+mov    x0, x21
+bl     0x1017195d0             ; ___lldb_unnamed_symbol108433
+```
+
+This is the clean end-to-end connection:
+
+1. Store response gives TTML string.
+2. Store completion creates an opaque lyrics object storing TTML as an `ITString` + `isTTML`.
+3. Later, when the app needs parsed timed lyrics, it calls this method (`86635`), which calls the TTML parser entrypoint (`108432`).
+
+###### TTML time parsing: `begin`/`end` + colon-separated time strings
+
+`___lldb_unnamed_symbol108709` (`0x101728E04`) reads TTML attributes:
+
+- `"begin"` -> stores `double` to `[this + 0x40]`
+- `"end"` -> stores `double` to `[this + 0x48]`
+
+It obtains attribute values via `108708` and converts via `108710` (`0x101728EF0`).
+
+`108710` is a time-string parser that splits on `":"` and uses `60.0` (double constant `0x404e000000000000`) to do `minutes * 60 + seconds` style accumulation (it looks like it supports `hh:mm:ss` too).
+
+###### TTML parsing high-level structure (from the lambda code strings)
+
+By chasing the vtables used with `EnumerateTreeChildren` (which is `___lldb_unnamed_symbol108714` @ `0x1017296F4`) and disassembling the call-operators, the TTML structure is very clear:
+
+1. Root `<tt>`
+  - extracts attributes:
+    - `itunes:lyricGenId`
+    - `xml:lang`
+  - then enumerates children
+2. `<head>`
+  - enumerates `<metadata>`
+  - within that, enumerates `iTunesMetadata`
+  - within that, enumerates:
+    - `Songwriters` -> `Songwriter` -> `TSLLyricsSongWriter::ParseXML`
+    - `Translations` -> `Translation` -> `TSLLyricsTranslation::ParseXML`
+3. `<body>`
+  - extracts attribute `dur` -> stores song duration (double)
+  - enumerates:
+    - “section” nodes (looks like `div`)
+    - “line” nodes (looks like `p`)
+
+Most importantly: the binary contains assert strings that literally include (very long) lambda source code and the path:
+
+- `/.../MusicDesktop/iTunes/Application/TSL/TSLLyricsXMLParser.cpp`
+
+with line numbers (e.g. 350, 356, 320-335, 166, 192, etc).
+
+###### Section + line parsing behavior
+
+From `out/dis_101729a0c.s` (`___lldb_unnamed_symbol108716`) there’s a string that shows the section parser enumerates its children and creates line objects, with additional behavior:
+
+- If `line->mLyricsText.Trim().IsEmpty()`:
+  - logs: `WARNING: Dropping empty line, time span %g - %g`
+- Else:
+  - sets `line->mParentSection = thisRef`
+  - sets `line->mLineIndex = line->mOriginalLineIndex = lyricsLineList.size()`
+  - pushes to both `mLines` and the outer `lyricsLineList`
+
+From `out/dis_1017294a4.s` (`___lldb_unnamed_symbol108713`) there’s a string that shows the line parser enumerates children and builds **word-level** timing:
+
+- For each `kXMLElementWord`:
+  - allocates `TSLLyricsWord`
+  - `word->ParseXML(lineNode, lineTreeNode)`
+  - sets `word->mParentLine = line`
+  - pushes into `mWords`
+
+This is enough to sketch a pretty faithful graph of the pipeline now:
+
+Store TTML string -> opaque lyrics object -> CreateFromTTML -> CFXML tree -> EnumerateTreeChildren -> build TSLLyricsSongInfo
+  - songwriters/translations from head metadata
+  - duration + sections(div) + lines(p) from body
+    - line begin/end + itunes:key + words from nested nodes
