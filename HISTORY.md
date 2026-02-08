@@ -2992,3 +2992,75 @@ Initial conclusion from the `setLyrics:` disassembly:
 Next direction:
 
 - I need a more structural way to find translation *consumption* (not parsing). The best hypothesis is still: find a function that touches both `songInfo + 0x90` (translations map) and `line + 0xC0` (line key), or otherwise enumerates `songInfo->mTranslationsMap` to produce a language list for UI.
+
+#### 2026-02-07 23:55-: New offset-xref scanner + more `TSLLyricsLine` layout confirmed
+
+I wrote a new helper script to scan the arm64e `__TEXT,__text` section for instructions that reference a given byte offset (as an `add/sub (immediate)` or an `ldr/str (unsigned immediate)`), grouped by function start addresses from `LC_FUNCTION_STARTS`.
+
+New script:
+
+- `scripts/find_arm64_member_offset_xrefs.py`
+
+Sanity compile:
+
+```sh
+python3 -m py_compile scripts/find_arm64_member_offset_xrefs.py
+```
+
+First pass (too noisy at first because stack frame offsets can also be `0x90`/`0xC0`):
+
+```sh
+python3 scripts/find_arm64_member_offset_xrefs.py --offset 0x90 --offset 0xC0 --require-all --limit 30
+```
+
+I updated the script to ignore base register `x29` (frame pointer) by default (`--include-fp` opt-in) and to always ignore `sp`-based matches. This made the results far more “object member”-like.
+
+##### Disassembly follow-up: one “0x90 + 0xC0 hit” was actually `TSLLyricsLine` construction/destruction
+
+One of the candidate functions in the TSLLyrics region was:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" -o "disassemble -s 0x10171b834 -c 650 -b -r" -o "quit" > out/dis_10171b834_offsets_90_c0.s
+```
+
+Key lines (evidence this is the `TSLLyricsLine` ctor/dtor region, not translation rendering):
+
+```asm
+; ctor-like init
+0x10171b87c: stur   q0, [x0, #0x98]     ; zero 16B at +0x98  (weak ptr storage)
+0x10171b880: stur   q0, [x0, #0xa8]     ; zero 16B at +0xa8
+0x10171b884: str    xzr, [x0, #0xb8]    ; completes 24B vector clear at +0xa8..+0xb8
+0x10171b888: add    x0, x0, #0xc0
+0x10171b88c: bl     0x100556794         ; constructs an ITString at `line + 0xC0` (line key)
+
+; dtor-like cleanup
+0x10171b8b0: add    x8, x19, #0xa8
+0x10171b8bc: bl     0x100843304         ; vector teardown (matches our `line + 0xA8` word vector)
+0x10171b8c0: ldr    x0, [x19, #0xa0]
+0x10171b8c8: bl     std::__1::__shared_weak_count::__release_weak()
+0x10171b8cc: ldr    x0, [x19, #0x90]
+0x10171b8d4: bl     std::__1::__shared_weak_count::__release_weak()
+```
+
+Implications for `TSLLyricsLine` layout (building on earlier findings):
+
+- `line + 0xA8 .. +0xB8` is a 24-byte `std::vector` (we previously suspected `mWords` at `+0xA8`, this ctor strongly supports it).
+- There are **two** weak-pointer control slots released in the dtor:
+  - ctrl at `line + 0xA0` implies a 16-byte `weak_ptr` at `line + 0x98` (matches our “next line” weak link storage).
+  - ctrl at `line + 0x90` implies a 16-byte `weak_ptr` at `line + 0x88` (very plausibly `mParentSection` as a weak reference to avoid cycles, but still a hypothesis).
+- `line + 0xC0` is initialized via an ITString ctor call: this matches the `itunes:key` line-key linkage.
+
+So: scanning for “offset 0x90” is tricky because `0x90` is also used as a weak ctrl pointer offset inside `TSLLyricsLine`, *not only* as `TSLLyricsSongInfo + 0x90` translations-map storage.
+
+## 2026-02-08
+
+Local time rolled over into a new day while I was working:
+
+```sh
+date
+# Sun Feb  8 00:17:09 EST 2026
+```
+
+#### 2026-02-08 00:05-: (note to self) avoid date rollover mistakes
+
+When I’m near midnight, I need to keep re-checking local time and only start a new `## YYYY-MM-DD` day header *after* the rollover (and include the `date` output as evidence).
