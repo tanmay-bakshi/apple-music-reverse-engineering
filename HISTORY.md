@@ -2414,3 +2414,65 @@ Next:
 
 - Find where `TSLLyricsSongInfo + 0x50` gets populated during parsing (probably in a callee of `CreateFromTTML`, since `108718` itself doesn’t obviously touch that offset in the initial 900-instruction dump).
 - Keep mining `108914` for actual “consumer logic” that might reference `mTranslationsMap` (offset `+0x90`) or per-line keys.
+
+#### 2026-02-07 21:58-: Big clarification: `songInfo + 0x50` is the root `xml:lang` (and `songInfo + 0x40` is `itunes:lyricGenId`)
+
+I was chasing “who writes `songInfo + 0x50`” and did a brute scan for `add x0, <reg>, #0x50` in `out/dis_*.s`.
+
+Command:
+
+```sh
+rg -n "add\\s+x0,\\s*x[0-9]+,\\s*#0x50\\b" out/dis_*.s | head
+```
+
+One of the hits was `out/dis_10172b6fc.s`, so I opened it.
+
+Commands:
+
+```sh
+sed -n '1,120p' out/dis_10172b6fc.s
+```
+
+Result: `___lldb_unnamed_symbol108783` @ `0x10172B6FC` is a root-level TTML parser that:
+
+1) Asserts/validates the root node name is `"tt"`.
+2) Reads attribute `"itunes:lyricGenId"` and stores it into `TSLLyricsSongInfo + 0x40` (ITString).
+3) Reads attribute `"xml:lang"` and stores it into `TSLLyricsSongInfo + 0x50` (ITString).
+
+Relevant snippet from `out/dis_10172b6fc.s`:
+
+```asm
+; out/dis_10172b6fc.s
+; ...
+; lookup "itunes:lyricGenId" and store into songInfo + 0x40
+0x10172b764:  adrp   x1, ... ; "itunes:lyricGenId"
+0x10172b780:  bl     0x101728b9c               ; 108708: attribute lookup
+0x10172b784:  ldr    x8, [x20, #0x8]
+0x10172b788:  ldr    x8, [x8]
+0x10172b78c:  add    x0, x8, #0x40
+0x10172b794:  bl     0x1007483b0               ; 39796: ITString store/copy
+
+; lookup "xml:lang" and store into songInfo + 0x50
+0x10172b7a8:  adrp   x1, ... ; "xml:lang"
+0x10172b7c4:  bl     0x101728b9c               ; 108708: attribute lookup
+0x10172b7c8:  ldr    x8, [x20, #0x8]
+0x10172b7cc:  ldr    x8, [x8]
+0x10172b7d0:  add    x0, x8, #0x50
+0x10172b7d8:  bl     0x1007483b0               ; 39796: ITString store/copy
+```
+
+This is a huge correction to my earlier “songInfo+0x50 might be plain lyrics” speculation.
+
+New interpretation:
+
+- `TSLLyricsSongInfo + 0x50` is *the base language tag for the whole TTML document* (root `xml:lang`).
+- `TSLLyricsSongInfo + 0x40` is an iTunes-specific ID-ish attribute (`itunes:lyricGenId`).
+
+This also retroactively makes the `0x10038E9AC` consumer make more sense:
+
+- `21817` copies `songInfo + 0x50` into `this + 0x1D0`.
+- So `this + 0x1D0` in that consumer is very likely storing the *lyrics language*, not the lyrics text.
+
+Next:
+
+- Find where the “flattened plain lyrics string” lives (it’s not `songInfo + 0x50`). That likely comes from walking `TSLLyricsLine`/`TSLLyricsWord` or a dedicated “flatten” helper (`108433` looked like a newline join).
