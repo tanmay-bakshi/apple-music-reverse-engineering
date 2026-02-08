@@ -2215,3 +2215,113 @@ Next:
 
 - Map the `<text>` child lambda itself (the one that does `mTranslationMap[key] = text`) so I can pin down the offsets for `TSLLyricsTranslationText::mLyricsText` precisely.
 - Continue the UI/consumer-side trace: find where `songInfo->mTranslationsMap` is queried, and how `itunes:key` is used when rendering.
+
+#### 2026-02-07 21:47-: Consumer-side CreateFromTTML callsite at `0x10038E9AC` (and what it does with the result)
+
+Context:
+
+Earlier I found that `TSLLyricsSongInfo::CreateFromTTML` is very likely `___lldb_unnamed_symbol108718` @ `0x101729D98`, and I had 3 callsites. I had already looked at two callsites (one via `108432`, one around `0x101730328`), but the third one was `0x10038E9AC`.
+
+This smells like a more “UI-ish” path (lower in the address space, lots of class/virtual dispatch + strings).
+
+Commands / artifacts:
+
+```sh
+# (sanity) local time still Feb 7
+date
+
+# disassemble the caller around the CreateFromTTML callsite
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10038e628 -c 420 -b -r" -o quit > out/dis_10038e628.s
+
+# verify the symbol name(s) for a couple addresses to avoid confusion about offsets
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "image lookup -a 0x10038e860" \
+  -o "image lookup -a 0x10038e2a0" -o quit
+
+# disassemble the helper used right before CreateFromTTML (CFData construction)
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x101186ad4 -c 420 -b -r" -o quit > out/dis_101186ad4.s
+
+# disassemble the tiny wrapper constructor used at sp+0x40
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10071e3d0 -c 260 -b -r" -o quit > out/dis_10071e3d0.s
+```
+
+Key observation: `___lldb_unnamed_symbol21817` @ `0x10038E628` calls `CreateFromTTML`, then immediately reads an `ITString` at offset `+0x50` from the parsed `TSLLyricsSongInfo` object and stores it into `this + 0x1D0`.
+
+Relevant slice (from `out/dis_10038e628.s`):
+
+```asm
+; out/dis_10038e628.s
+; ...
+0x10038e988 <+864>:  ldr    x0, [x20]
+0x10038e98c <+868>:  bl     0x101186ad4               ; 86634
+0x10038e990 <+872>:  add    x8, sp, #0x40
+0x10038e994 <+876>:  bl     0x10071e3d0               ; 38737
+0x10038e998 <+880>:  ldr    x8, [sp, #0x40]
+0x10038e99c <+884>:  cbz    x8, 0x10038e9e4
+
+; pass __CFData const* const& as a reference (store pointer at [sp], pass x0=&[sp])
+0x10038e9a0 <+888>:  str    x8, [sp]
+0x10038e9a4 <+892>:  add    x8, sp, #0x10             ; sret: std::shared_ptr<TSLLyricsSongInfo>
+0x10038e9a8 <+896>:  mov    x0, sp                    ; arg0: &__CFData*
+0x10038e9ac <+900>:  bl     0x101729d98               ; 108718: TSLLyricsSongInfo::CreateFromTTML
+
+; if songInfo != nullptr:
+0x10038e9b0 <+904>:  ldr    x8, [sp, #0x10]            ; shared_ptr.get()
+0x10038e9b4 <+908>:  cbz    x8, 0x10038e9d8
+
+; copy songInfo + 0x50 (ITString) into this + 0x1D0 (ITString)
+0x10038e9b8 <+912>:  mov    x0, sp                    ; dest ITString (stack temp)
+0x10038e9bc <+916>:  add    x1, x8, #0x50             ; src ITString (songInfo+0x50)
+0x10038e9c0 <+920>:  bl     0x100747c84               ; 39781: ITString copy
+0x10038e9c4 <+924>:  add    x0, x19, #0x1d0           ; this+0x1D0
+0x10038e9c8 <+928>:  mov    x1, sp                    ; src temp
+0x10038e9cc <+932>:  bl     0x1007483b0               ; 39796: ITString store/copy
+0x10038e9d0 <+936>:  mov    x0, sp
+0x10038e9d4 <+940>:  bl     0x100747c5c               ; 39780: ITString dtor
+; ...
+```
+
+What this tells me:
+
+- This is a clean, high-confidence confirmation that `108718` returns a `std::shared_ptr<TSLLyricsSongInfo>` by value (AArch64 ABI: hidden sret pointer in `x8`).
+- The `__CFData const* const&` argument behavior is exactly what I expected: store the CFData pointer in memory, pass a pointer-to-that-memory.
+- There is at least one “consumer” of `TSLLyricsSongInfo` that does *not* walk the per-line/per-word structure; it immediately grabs a single string field at `songInfo + 0x50` and copies it into its own `ITString` field.
+  - I don’t yet know if `songInfo+0x50` is “plain lyrics text”, “original TTML”, “a pre-flattened text blob”, or something else, but it’s an `ITString` that’s treated as an important derived product of the TTML parse.
+
+Now: how does this callsite get the CFData for `CreateFromTTML`?
+
+It calls `___lldb_unnamed_symbol86634` @ `0x101186AD4` first. Disassembling `86634` shows it’s basically:
+
+1) Ensure `obj + 0x20` (an `ITString`) is *not empty* using `39808`.
+2) Convert that `ITString` to a `CFStringRef` (via `38954`).
+3) Convert CFString to CFData using `CFStringCreateExternalRepresentation` with UTF-8 encoding (`kCFStringEncodingUTF8 = 0x08000100`).
+
+The embedded assert string is very explicit:
+
+- `"lyricsCFString != nullptr"`
+
+So `86634` is a very plausible “encode lyrics string as CFData” helper (where the string is likely the TTML payload).
+
+The `38737` helper called right after is almost comically tiny:
+
+```asm
+; out/dis_10071e3d0.s
+0x10071e3d0 <+0>: str  x0, [x8]
+0x10071e3d4 <+4>: strb wzr, [x8, #0x8]
+0x10071e3d8 <+8>: ret
+```
+
+This looks like construction of a trivial “CFType wrapper” struct at `sp+0x40`:
+
+- `[sp+0x40]` = `CFDataRef`
+- `[sp+0x48]` = some boolean/flag byte, set to 0
+
+So the CFData that goes into `CreateFromTTML` is literally the external representation of whatever lyrics string is stored in the upstream object’s `ITString` at offset `+0x20`.
+
+Open questions / immediate follow-ups:
+
+- What exactly is `songInfo + 0x50`? I should locate writes to that offset inside `CreateFromTTML` (or its callees), or search for other consumers that read the same offset.
+- What is the type of the upstream “lyrics object” passed into `86634` (the thing that has `ITString` at `+0x20` and another 32-bit field at `+0x34` read earlier in `21817`)?
