@@ -2112,3 +2112,106 @@ Next: disassemble `0x10171BACC` (`108466`) and the `108874/108875` helpers (`0x1
 
 - what type `mTranslationsMap` is (std::map vs unordered_map vs custom)
 - what the inner “translation map” key/value types are
+
+#### 2026-02-07 21:30-21:40
+
+Goal: answer the question I left hanging above: what are the key/value types of the translation maps, and what XML attribute ties translations back to specific body lines?
+
+##### Pulling `TSLLyricsTranslation::ParseXML` from the translation object's vtable
+
+In the translation-node lambda (`108842` @ `0x10172CAC8`) the translation object vtable address-point is computed from:
+
+- `adrp x16, ...` -> page `0x101F78000`
+- `add x16, x16, #0x358` + `#0x10` -> vtable address-point `0x101F78368`
+
+I read that vtable to get the `ParseXML` target at offset `+0x18`:
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "memory read --format x --size 8 --count 16 0x101f78368" -o quit
+
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10172d098 -c 420 -b -r" -o quit > out/dis_10172d098.s
+```
+
+Result:
+
+- `TSLLyricsTranslation::ParseXML` = `___lldb_unnamed_symbol108848` @ `0x10172D098`
+
+Key observations from `out/dis_10172d098.s`:
+
+- It reads `xml:lang` and stores it into `translation + 0x38`:
+
+```asm
+; out/dis_10172d098.s
+adrp   x1, ... ; "xml:lang"
+bl     0x101728b9c               ; 108708: attribute lookup
+add    x0, x20, #0x38            ; this + 0x38
+bl     0x1007483b0               ; 39796: store/copy ITString
+```
+
+- It enumerates child nodes and looks specifically for a `"text"` element (kXMLElementTranslationText).
+- The embedded assert string is extremely explicit about the translation map shape:
+
+  `mTranslationMap[ line->mLyricsLineKey ] = line->mLyricsText;`
+
+  where `line` is a `TSLLyricsTranslationText` parsed from the `<text>` element.
+
+So: the per-translation inner map is keyed by a “lyrics line key”, not by timestamp/index.
+
+##### Pulling `TSLLyricsTranslationText::ParseXML` and finding the attribute name for the line key
+
+The `<text>` child lambda allocates `TSLLyricsTranslationText` and calls `ParseXML` on it. I extracted the `ParseXML` target by reading the translation-text object's vtable address-point computed in the lambda:
+
+- `adrp` page `0x101F78000`
+- `add #0x410` + `#0x10` -> vtable address-point `0x101F78420`
+
+Commands:
+
+```sh
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "memory read --format x --size 8 --count 12 0x101f78420" -o quit
+
+lldb -o "target create '/System/Applications/Music.app/Contents/MacOS/Music'" \
+  -o "disassemble -s 0x10172d6ac -c 420 -b -r" -o quit > out/dis_10172d6ac.s
+```
+
+Result:
+
+- `TSLLyricsTranslationText::ParseXML` = `___lldb_unnamed_symbol108862` @ `0x10172D6AC`
+
+Key observations from `out/dis_10172d6ac.s`:
+
+- It first calls the shared `TSLLyricsTextElement::ParseXML` (`108711` @ `0x101729048`), so `<text>` inherits the common “begin/end + text content” parsing.
+- Then it reads an attribute named `"for"` and stores it into `this + 0x70`:
+
+```asm
+; out/dis_10172d6ac.s
+adrp   x1, ... ; "for"
+bl     0x101728b9c               ; 108708: attribute lookup
+add    x0, x20, #0x70            ; likely mLyricsLineKey
+bl     0x1007483b0               ; 39796: store/copy ITString
+```
+
+This is *very* suggestive:
+
+- Body lines (`<p>`) carry an `itunes:key` attribute (I previously saw it stored into `TSLLyricsLine + 0xC0`).
+- Translation text nodes (`<text>`) carry a `for="<key>"` attribute, which I strongly suspect references that same `itunes:key` value.
+
+So the “lyrics key” linking translations to body lines is:
+
+- Original line: `itunes:key="..."`
+- Translated line: `<text for="...">translated text...</text>`
+
+This basically explains how the UI can do per-line translations without messing with timestamps.
+
+##### Quick note: `TSLLyricsSongWriter::ParseXML` also exists and is attribute-driven
+
+While I was in the vtable-reading groove, I also chased the song-writer parse function via the writer object's vtable and confirmed it reads an `"artistId"` attribute into `writer + 0x48` (see `out/dis_101729c78.s`). I haven't yet mapped the rest of the writer fields (name text vs role, etc).
+
+Next:
+
+- Map the `<text>` child lambda itself (the one that does `mTranslationMap[key] = text`) so I can pin down the offsets for `TSLLyricsTranslationText::mLyricsText` precisely.
+- Continue the UI/consumer-side trace: find where `songInfo->mTranslationsMap` is queried, and how `itunes:key` is used when rendering.
